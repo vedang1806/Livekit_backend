@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #111;
+      width: 1920px;
+      height: 1080px;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+    }
+
+    #grid {
+      display: grid;
+      width: 100%;
+      height: 100%;
+      gap: 4px;
+      background: #111;
+    }
+
+    .tile {
+      position: relative;
+      background: #222;
+      overflow: hidden;
+    }
+
+    .tile video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .name-label {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 12px 16px;
+      background: linear-gradient(transparent, rgba(0,0,0,0.85));
+      color: #fff;
+      font-size: 36px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      text-shadow: 0 2px 6px rgba(0,0,0,0.9);
+    }
+
+    .name-label .role {
+      display: block;
+      font-size: 42px;
+      color: #4fc3f7;
+    }
+  </style>
+</head>
+<body>
+  <div id="grid"></div>
+
+  <script src="https://unpkg.com/livekit-client/dist/livekit-client.umd.min.js"></script>
+  <script>
+    const params  = new URLSearchParams(location.search);
+    const wsURL   = params.get('url');
+    const token   = params.get('access_token');
+    const grid    = document.getElementById('grid');
+    const tiles   = {};   // identity → tile element
+
+    function setGridLayout(count) {
+      const cols = count <= 1 ? 1 : count <= 2 ? 2 : count <= 4 ? 2 : 3;
+      grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    }
+
+    function addTile(participant) {
+      if (tiles[participant.identity]) return;
+
+      const tile  = document.createElement('div');
+      tile.className = 'tile';
+
+      const video = document.createElement('video');
+      video.autoplay = true;
+      video.muted    = true;
+      video.playsInline = true;
+
+      const label = document.createElement('div');
+      label.className = 'name-label';
+
+      // name field is set to role (DOCTOR / PATIENT / INTERPRETER)
+      const name = participant.name || participant.identity;
+      label.innerHTML = `<span class="role">${name}</span>`;
+
+      tile.appendChild(video);
+      tile.appendChild(label);
+      grid.appendChild(tile);
+      tiles[participant.identity] = { tile, video };
+      setGridLayout(Object.keys(tiles).length);
+    }
+
+    function removeTile(participant) {
+      const entry = tiles[participant.identity];
+      if (entry) {
+        entry.tile.remove();
+        delete tiles[participant.identity];
+        setGridLayout(Object.keys(tiles).length);
+      }
+    }
+
+    function attachTrack(participant, track) {
+      const entry = tiles[participant.identity];
+      if (!entry || track.kind !== 'video') return;
+      track.attach(entry.video);
+    }
+
+    async function main() {
+      const room = new LivekitClient.Room();
+
+      room.on(LivekitClient.RoomEvent.ParticipantConnected, (p) => {
+        addTile(p);
+        p.on(LivekitClient.ParticipantEvent.TrackSubscribed, (track) => attachTrack(p, track));
+      });
+
+      room.on(LivekitClient.RoomEvent.ParticipantDisconnected, removeTile);
+
+      room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+        attachTrack(participant, track);
+      });
+
+      await room.connect(wsURL, token);
+
+      // Render participants already in the room when egress connects
+      for (const [, p] of room.remoteParticipants) {
+        addTile(p);
+        for (const [, pub] of p.trackPublications) {
+          if (pub.track) attachTrack(p, pub.track);
+        }
+      }
+    }
+
+    main().catch(console.error);
+  </script>
+</body>
+</html>

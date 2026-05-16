@@ -5,7 +5,11 @@ FastAPI entry point: token minting, room management, health check.
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
+import asyncio
+import json
 import logging
 import uvicorn
 
@@ -13,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 
 from config import settings
 from tokens import generate_participant_token, generate_admin_token
-from webhook import handle_livekit_webhook, clear_active_egress
+from webhook import handle_livekit_webhook, clear_active_egress, subscribe_sse, unsubscribe_sse
 from egress import (
     create_room,
     start_composite_egress,
@@ -53,10 +57,41 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ── SSE ───────────────────────────────────────────────────────────────────────
+
+@app.get("/egress/events", tags=["egress"])
+async def egress_events(session_id: str = Query(...)):
+    """
+    Server-Sent Events stream — fires once when egress ends for this session.
+    Frontend connects here after session starts and waits for the 'egress_ended' event,
+    then fetches /egress/recording-url to get the presigned link.
+    """
+    queue = subscribe_sse(session_id)
+
+    async def stream():
+        try:
+            yield "data: {\"event\": \"connected\"}\n\n"
+            while True:
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=300)
+                    yield f"data: {json.dumps(msg)}\n\n"
+                    if msg.get("event") == "egress_ended":
+                        break
+                except asyncio.TimeoutError:
+                    yield "data: {\"event\": \"keepalive\"}\n\n"
+        finally:
+            unsubscribe_sse(session_id, queue)
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -105,7 +140,7 @@ async def get_token(
     if role not in VALID_ROLES:
         raise HTTPException(status_code=400, detail=f"role must be one of {VALID_ROLES}")
 
-    display_name = f"{role.upper()} — {identity}"
+    display_name = role.upper()  # short role label renders clearly on video tile
     token = generate_participant_token(
         room_name=room,
         identity=identity,
@@ -177,6 +212,65 @@ async def egress_stop(body: StopEgressRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/egress/status", tags=["egress"])
+async def egress_status(session_id: str = Query(...)):
+    """
+    Returns both LiveKit egress state AND S3 file availability.
+    Use this to know when recording is ready — poll until status == 'ready'.
+    """
+    import boto3
+    from botocore.exceptions import ClientError as BotoClientError
+
+    # ── 1. Check LiveKit egress state ─────────────────────────────────────────
+    livekit_status = "unknown"
+    egress_id      = None
+    try:
+        data    = await list_egress(room_name=session_id)
+        items   = data.get("items", [])
+        if items:
+            latest       = items[-1]
+            livekit_status = latest.get("status", "unknown")
+            egress_id      = latest.get("egressId") or latest.get("egress_id")
+        else:
+            livekit_status = "no_egress_found"
+    except Exception as e:
+        livekit_status = f"error: {e}"
+
+    # ── 2. Check S3 file ──────────────────────────────────────────────────────
+    s3_key  = f"sessions/{session_id}/composite_recording.mp4"
+    s3      = boto3.client(
+        "s3",
+        region_name=settings.aws_region,
+        aws_access_key_id=settings.aws_access_key,
+        aws_secret_access_key=settings.aws_secret_key,
+    )
+    s3_ready = False
+    size_mb  = None
+    try:
+        head    = s3.head_object(Bucket=settings.s3_bucket, Key=s3_key)
+        size_mb = round(head["ContentLength"] / (1024 * 1024), 2)
+        s3_ready = True
+    except BotoClientError:
+        pass
+
+    status = "ready" if s3_ready else (
+        "egress_active" if livekit_status in ("EGRESS_STARTING", "EGRESS_ACTIVE") else
+        "uploading"     if livekit_status in ("EGRESS_ENDING", "EGRESS_COMPLETE") else
+        "failed"        if livekit_status in ("EGRESS_FAILED", "no_egress_found") else
+        "processing"
+    )
+
+    return {
+        "session_id":     session_id,
+        "status":         status,
+        "livekit_status": livekit_status,
+        "egress_id":      egress_id,
+        "s3_ready":       s3_ready,
+        "size_mb":        size_mb,
+        "s3_key":         s3_key,
+    }
+
+
 @app.get("/egress/recording-url", response_model=RecordingUrlResponse, tags=["egress"])
 async def egress_recording_url(
     session_id: str = Query(...),
@@ -185,9 +279,12 @@ async def egress_recording_url(
     """
     Get a presigned S3 URL to view/download the session recording.
     The URL is time-limited — default 1 hour, max 7 days.
+
+    Returns 404 if the recording is still being processed (egress running or uploading).
+    Retry after ~10–30s for the file to be ready.
     """
     try:
-        result = get_recording_presigned_url(session_id, expires_in=expires_in)
+        result = await get_recording_presigned_url(session_id, expires_in=expires_in)
         return RecordingUrlResponse(session_id=session_id, **result)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))

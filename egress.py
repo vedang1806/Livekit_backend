@@ -5,6 +5,7 @@ All functions are async and use httpx.
 Errors print the raw LiveKit response before raising so debugging is easy.
 """
 
+import asyncio
 import httpx
 import boto3
 from botocore.exceptions import ClientError
@@ -129,7 +130,7 @@ async def start_composite_egress(
     url  = f"{_http_base()}/twirp/livekit.Egress/StartRoomCompositeEgress"
     body = {
         "room_name":  room_name,
-        "layout":     "grid-dark",   # dark theme — white name labels clearly visible per tile
+        "layout":     "grid-dark",
         "audio_only": audio_only,
         "file_outputs": [{
             "file_type": file_type,
@@ -228,39 +229,44 @@ async def start_track_egress(
     return data
 
 
-def get_recording_presigned_url(session_id: str, expires_in: int = 3600) -> dict:
+async def get_recording_presigned_url(session_id: str, expires_in: int = 3600) -> dict:
     """
-    Generate a presigned URL for the session's composite recording.
+    Generate a presigned URL for the session's composite recording asynchronously.
     Raises FileNotFoundError if the file hasn't been uploaded to S3 yet
     (egress still running or upload in progress).
     """
-    s3_key = f"sessions/{session_id}/composite_recording.mp4"
-    s3_client = boto3.client(
-        "s3",
-        region_name=settings.aws_region,
-        aws_access_key_id=settings.aws_access_key,
-        aws_secret_access_key=settings.aws_secret_key,
-    )
+    def _blocking_get_url():
+        s3_key = f"sessions/{session_id}/composite_recording.mp4"
+        s3_client = boto3.client(
+            "s3",
+            region_name=settings.aws_region,
+            aws_access_key_id=settings.aws_access_key,
+            aws_secret_access_key=settings.aws_secret_key,
+        )
 
-    # Verify the file exists before handing out a URL that will 404.
-    try:
-        s3_client.head_object(Bucket=settings.s3_bucket, Key=s3_key)
-    except ClientError as e:
-        code = e.response["Error"]["Code"]
-        if code in ("404", "NoSuchKey"):
-            raise FileNotFoundError(
-                f"Recording not ready yet for session '{session_id}'. "
-                "Wait until the session ends and the upload completes (~10–30s after stop)."
-            )
-        raise
+        # Verify the file exists before handing out a URL that will 404.
+        try:
+            s3_client.head_object(Bucket=settings.s3_bucket, Key=s3_key)
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("404", "NoSuchKey"):
+                raise FileNotFoundError(
+                    f"Recording not ready yet for session '{session_id}'. "
+                    "Egress may still be running or file is uploading. "
+                    "Retry after ~10–30s."
+                )
+            raise
 
-    url = s3_client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": settings.s3_bucket, "Key": s3_key},
-        ExpiresIn=expires_in,
-    )
-    print(f"  Presigned URL ({expires_in}s): {url}")
-    return {"s3_key": s3_key, "url": url, "expires_in": expires_in}
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.s3_bucket, "Key": s3_key},
+            ExpiresIn=expires_in,
+        )
+        print(f"  Presigned URL ({expires_in}s): {url}")
+        return {"s3_key": s3_key, "url": url, "expires_in": expires_in}
+
+    # Run boto3 S3 calls in thread pool to avoid blocking event loop
+    return await asyncio.to_thread(_blocking_get_url)
 
 
 async def list_egress(room_name: str) -> dict:
