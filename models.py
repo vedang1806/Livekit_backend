@@ -72,7 +72,19 @@ class RecordingUrlResponse(BaseModel):
     expires_in:  int             # seconds until the presigned URL expires
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# ── Per-Participant Recordings ────────────────────────────────────────────────
+
+class ParticipantRecording(BaseModel):
+    identity:    str             # participant identity (e.g., "doctor_123")
+    role:        str             # role from participant name (DOCTOR, PATIENT, INTERPRETER)
+    s3_key:      str             # S3 path to the OGG file
+    url:         str             # presigned URL to download
+    expires_in:  int             # seconds until URL expires
+
+class ParticipantRecordingsResponse(BaseModel):
+    session_id:  str
+    recordings:  List[ParticipantRecording]  # one per participant
+    expires_in:  int
 
 class HealthResponse(BaseModel):
     status:      str

@@ -36,6 +36,7 @@ from models import (
     StopEgressResponse,
     ParticipantsResponse,
     RecordingUrlResponse,
+    ParticipantRecordingsResponse,
     HealthResponse,
 )
 
@@ -292,7 +293,117 @@ async def egress_recording_url(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/egress/list", tags=["egress"])
+@app.get("/egress/participant-recordings", tags=["egress"])
+async def participant_recordings(
+    session_id: str = Query(...),
+    expires_in: int = Query(3600, description="Presigned URL TTL in seconds"),
+):
+    """
+    Get presigned URLs for all per-participant OGG recordings.
+    
+    Each participant's audio is recorded separately with their identity in the filename.
+    This endpoint returns all of them with their role (parsed from participant name).
+    
+    Frontend can display these side-by-side with role labels to show who's speaking when.
+    
+    Returns 404 if no recordings exist yet (egress still running or no audio tracks published).
+    """
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+        from models import ParticipantRecording, ParticipantRecordingsResponse
+        
+        # List S3 objects matching sessions/{session_id}/audio/*.ogg
+        s3_client = boto3.client(
+            "s3",
+            region_name=settings.aws_region,
+            aws_access_key_id=settings.aws_access_key,
+            aws_secret_access_key=settings.aws_secret_key,
+        )
+        
+        prefix = f"sessions/{session_id}/audio/"
+        try:
+            resp = s3_client.list_objects_v2(Bucket=settings.s3_bucket, Prefix=prefix)
+        except ClientError as e:
+            raise HTTPException(status_code=500, detail=f"S3 error: {e}")
+        
+        if "Contents" not in resp:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No per-participant recordings found for session {session_id}. Egress may still be running or no audio tracks detected."
+            )
+        
+        # Filter for .ogg files (per-participant recordings)
+        ogg_files = [
+            obj for obj in resp.get("Contents", [])
+            if obj["Key"].endswith(".ogg")
+        ]
+        
+        if not ogg_files:
+            raise HTTPException(
+                status_code=404,
+                detail="No per-participant audio recordings found yet. Waiting for audio tracks to be published..."
+            )
+        
+        # Get room participants to map identity → role (from participant.name)
+        try:
+            participants_data = await get_room_participants(session_id)
+            # Build identity → name mapping
+            identity_to_role = {
+                p["identity"]: p.get("name", p["identity"])
+                for p in participants_data.get("participants", [])
+            }
+        except HTTPException:
+            # Room doesn't exist anymore (session ended) - can't get participants
+            # But we can still return the OGG files with identity as role
+            identity_to_role = {}
+        except Exception as e:
+            # Other errors - use identity as role
+            identity_to_role = {}
+        
+        # Build recording list
+        recordings = []
+        for obj in ogg_files:
+            s3_key = obj["Key"]
+            # Extract identity from filename: sessions/{session_id}/audio/{identity}.ogg
+            filename = s3_key.split("/")[-1]  # e.g., "doctor_1234567.ogg"
+            identity = filename.replace(".ogg", "")
+            
+            # Get role for this identity from participant list
+            role = identity_to_role.get(identity, identity)
+            
+            # Generate presigned URL
+            try:
+                url = s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": settings.s3_bucket, "Key": s3_key},
+                    ExpiresIn=expires_in,
+                )
+                recordings.append(
+                    ParticipantRecording(
+                        identity=identity,
+                        role=role,
+                        s3_key=s3_key,
+                        url=url,
+                        expires_in=expires_in,
+                    )
+                )
+            except ClientError:
+                continue  # Skip files we can't generate URLs for
+        
+        return ParticipantRecordingsResponse(
+            session_id=session_id,
+            recordings=recordings,
+            expires_in=expires_in,
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing recordings: {str(e)}")
+
+
+
 async def egress_list(session_id: str = Query(...)):
     """List all egress jobs for a session (active + historical)."""
     try:
