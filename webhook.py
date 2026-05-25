@@ -32,6 +32,9 @@ _active_egress: dict[str, str] = {}          # room_name → egress_id
 # Key: (room_name, track_sid)
 _active_track_egress: set[tuple] = set()
 
+# Deduplication: egress IDs we've already processed egress_ended for.
+_ended_egress_ids: set[str] = set()
+
 # SSE queues — frontend subscribers waiting for egress_ended per session.
 # room_name → list of asyncio.Queue
 _sse_subscribers: dict[str, list] = {}
@@ -194,15 +197,29 @@ async def _on_track_published(room_name: str, event: dict) -> None:
 
 
 async def _on_egress_ended(room_name: str, event: dict) -> None:
-    egress_id = event.get("egressInfo", {}).get("egressId", "")
-    _active_egress.pop(room_name, None)
+    egress_info = event.get("egressInfo", {})
+    egress_id   = egress_info.get("egressId", "")
+    status      = egress_info.get("status", "")
+
+    # Deduplicate: LiveKit occasionally sends the same egress_ended twice.
+    if egress_id in _ended_egress_ids:
+        logger.info(f"Duplicate egress_ended ignored: {egress_id}")
+        return
+    _ended_egress_ids.add(egress_id)
+
+    # Only clear the composite ref if this egress IS the composite for the room.
+    if _active_egress.get(room_name) == egress_id:
+        _active_egress.pop(room_name, None)
+
+    # Clear per-participant track egresses for the room on any egress end.
     stale = {key for key in _active_track_egress if key[0] == room_name}
     _active_track_egress.difference_update(stale)
-    logger.info(f"Egress ended: {egress_id} | room={room_name}")
 
-    # Notify all SSE subscribers waiting for this room
+    logger.info(f"Egress ended: {egress_id} | room={room_name} | status={status}")
+
+    # Notify SSE subscribers — include status so frontend can handle ABORTED.
     for queue in _sse_subscribers.get(room_name, []):
-        await queue.put({"event": "egress_ended", "session_id": room_name})
+        await queue.put({"event": "egress_ended", "session_id": room_name, "status": status})
 
 
 def subscribe_sse(room_name: str) -> asyncio.Queue:
