@@ -115,12 +115,13 @@
 
       room.on(LivekitClient.RoomEvent.ParticipantConnected, (p) => {
         addTile(p);
-        p.on(LivekitClient.ParticipantEvent.TrackSubscribed, (track) => attachTrack(p, track));
       });
 
       room.on(LivekitClient.RoomEvent.ParticipantDisconnected, removeTile);
 
+      // Fires for every subscribed track — addTile is idempotent so safe to call here too
       room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+        addTile(participant);
         attachTrack(participant, track);
       });
 

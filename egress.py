@@ -113,9 +113,10 @@ async def start_composite_egress(
     """
     Start a RoomCompositeEgress that records the full room.
 
-    Layout 'grid':
-      - All participants tiled in a grid
-      - Display name (set in JWT 'name' field) overlaid on each tile
+    Layout:
+      - Uses custom HTML template (static/layout.html) when PUBLIC_URL is set.
+        Each tile shows a large role label (DOCTOR / INTERPRETER) from the JWT 'name' field.
+      - Falls back to built-in 'grid-dark' if PUBLIC_URL is not configured.
       - Renders as MP4 (video+audio) or OGG (audio-only)
 
     Important: call this AFTER participants have joined and published tracks.
@@ -128,22 +129,33 @@ async def start_composite_egress(
     s3_key    = f"sessions/{session_id}/composite_recording.{extension}"
 
     url  = f"{_http_base()}/twirp/livekit.Egress/StartRoomCompositeEgress"
-    body = {
+
+    # Use custom layout if PUBLIC_URL is set, otherwise fall back to built-in grid-dark.
+    # Custom layout renders each participant tile with a large role label (DOCTOR / INTERPRETER).
+    custom_url = settings.public_url.rstrip("/") if settings.public_url else ""
+    body: dict = {
         "room_name":  room_name,
-        "layout":     "grid-dark",
         "audio_only": audio_only,
-        "file_outputs": [{
-            "file_type": file_type,
-            "filepath":  s3_key,
-            "s3": {
-                "access_key": settings.aws_access_key,
-                "secret":     settings.aws_secret_key,
-                "region":     settings.aws_region,
-                "bucket":     settings.s3_bucket,
-                "key":        s3_key,
-            },
-        }],
     }
+    if custom_url:
+        # ngrok free tier shows a browser interstitial — skip it via query param.
+        # Harmless on non-ngrok hosts.
+        layout_url = f"{custom_url}/static/layout.html?ngrok-skip-browser-warning=true"
+        body["custom_base_url"] = layout_url
+    else:
+        body["layout"] = "grid-dark"
+
+    body["file_outputs"] = [{
+        "file_type": file_type,
+        "filepath":  s3_key,
+        "s3": {
+            "access_key": settings.aws_access_key,
+            "secret":     settings.aws_secret_key,
+            "region":     settings.aws_region,
+            "bucket":     settings.s3_bucket,
+            "key":        s3_key,
+        },
+    }]
 
     data = await _post(url, body, _egress_headers(room_name))
     data["s3_key"] = s3_key
