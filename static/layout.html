@@ -57,13 +57,14 @@
 <body>
   <div id="grid"></div>
 
-  <script src="https://unpkg.com/livekit-client/dist/livekit-client.umd.min.js"></script>
+  <!-- Self-hosted livekit-client v2.19.0 — no external CDN dependency -->
+  <script src="/static/livekit-client.umd.min.js"></script>
   <script>
-    const params  = new URLSearchParams(location.search);
-    const wsURL   = params.get('url');
-    const token   = params.get('token') || params.get('access_token');
-    const grid    = document.getElementById('grid');
-    const tiles   = {};   // identity → tile element
+    const params = new URLSearchParams(location.search);
+    const wsURL  = params.get('url');
+    const token  = params.get('token') || params.get('access_token');
+    const grid   = document.getElementById('grid');
+    const tiles  = {};
 
     function setGridLayout(count) {
       const cols = count <= 1 ? 1 : count <= 2 ? 2 : count <= 4 ? 2 : 3;
@@ -72,22 +73,16 @@
 
     function addTile(participant) {
       if (tiles[participant.identity]) return;
-
       const tile  = document.createElement('div');
       tile.className = 'tile';
-
       const video = document.createElement('video');
       video.autoplay = true;
       video.muted    = true;
       video.playsInline = true;
-
       const label = document.createElement('div');
       label.className = 'name-label';
-
-      // name field is set to role (DOCTOR / PATIENT / INTERPRETER)
       const name = participant.name || participant.identity;
       label.innerHTML = `<span class="role">${name}</span>`;
-
       tile.appendChild(video);
       tile.appendChild(label);
       grid.appendChild(tile);
@@ -111,15 +106,18 @@
     }
 
     async function main() {
-      const room = new LivekitClient.Room();
+      if (!wsURL || !token) {
+        document.body.style.background = 'red';
+        throw new Error('Missing url or token params: url=' + wsURL + ' token=' + (token ? 'ok' : 'MISSING'));
+      }
 
-      room.on(LivekitClient.RoomEvent.ParticipantConnected, (p) => {
-        addTile(p);
+      const room = new LivekitClient.Room({
+        adaptiveStream: false,
+        dynacast: false,
       });
 
+      room.on(LivekitClient.RoomEvent.ParticipantConnected, addTile);
       room.on(LivekitClient.RoomEvent.ParticipantDisconnected, removeTile);
-
-      // Fires for every subscribed track — addTile is idempotent so safe to call here too
       room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
         addTile(participant);
         attachTrack(participant, track);
@@ -127,16 +125,19 @@
 
       await room.connect(wsURL, token);
 
-      // Render participants already in the room when egress connects
-      for (const [, p] of room.remoteParticipants) {
+      // Render participants already in the room when egress joins
+      room.remoteParticipants.forEach((p) => {
         addTile(p);
-        for (const [, pub] of p.trackPublications) {
+        p.trackPublications.forEach((pub) => {
           if (pub.track) attachTrack(p, pub.track);
-        }
-      }
+        });
+      });
     }
 
-    main().catch(console.error);
+    main().catch((err) => {
+      console.error('[layout] Fatal error:', err);
+      document.title = 'ERROR: ' + err.message;
+    });
   </script>
 </body>
 </html>
