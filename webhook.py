@@ -339,18 +339,26 @@ async def _on_room_finished(room_name: str) -> None:
     """
     _finished_rooms.add(room_name)
 
-    # Safety net: if composite still running (e.g. stop_egress failed),
-    # try once more — may still get ABORTED but worth trying
     egress_id = _active_egress.get(room_name)
     if egress_id:
-        logger.warning(
-            f"⚠️  room_finished but composite {egress_id} still active — "
-            f"stop_egress may have failed earlier. Trying again (may ABORT)."
-        )
-        try:
-            await stop_egress(egress_id=egress_id, room_name=room_name)
-        except Exception as e:
-            logger.error(f"❌ Safety-net stop_egress failed: {e}", exc_info=True)
+        if room_name in _pending_stop:
+            # Composite never reached EGRESS_ACTIVE before room died.
+            # Calling stop_egress on a STARTING composite gives ABORTED — don't bother.
+            # LiveKit will auto-abort it when the room is gone.
+            logger.warning(
+                f"⚠️  room_finished while composite {egress_id} still STARTING "
+                f"(never reached EGRESS_ACTIVE) — letting LiveKit auto-abort it."
+            )
+        else:
+            # Safety net: composite was ACTIVE but stop_egress call failed earlier.
+            logger.warning(
+                f"⚠️  room_finished but composite {egress_id} still active — "
+                f"stop_egress may have failed earlier. Trying again (may ABORT)."
+            )
+            try:
+                await stop_egress(egress_id=egress_id, room_name=room_name)
+            except Exception as e:
+                logger.error(f"❌ Safety-net stop_egress failed: {e}", exc_info=True)
 
     _cleanup_room_state(room_name)
     logger.info(f"🚪 Room finished and cleaned up: {room_name}")
