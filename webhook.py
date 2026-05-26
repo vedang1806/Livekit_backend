@@ -21,7 +21,7 @@ import logging
 from fastapi import Request, HTTPException
 
 from config import settings  # noqa: used in log strings
-from egress import start_composite_egress, start_track_egress, list_egress
+from egress import start_composite_egress, start_track_egress, list_egress, stop_egress
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +99,10 @@ async def handle_livekit_webhook(request: Request) -> dict:
         asyncio.create_task(_on_track_published(room_name, event))
     elif event_type == "egress_ended":
         logger.info(f"🏁 Queuing _on_egress_ended for {room_name}")
-        # Queue async processing and return 200 OK immediately
         asyncio.create_task(_on_egress_ended(room_name, event))
+    elif event_type == "room_finished":
+        logger.info(f"🚪 Queuing _on_room_finished for {room_name}")
+        asyncio.create_task(_on_room_finished(room_name))
     else:
         # Drop all other events immediately
         logger.debug(f"⊘ Ignoring event type: {event_type}")
@@ -167,7 +169,7 @@ async def _on_track_published(room_name: str, event: dict) -> None:
                         session_id=room_name,
                         audio_only=False,
                     )
-                    _active_egress[room_name] = result.get("egress_id", "")
+                    _active_egress[room_name] = result.get("egressId") or result.get("egress_id", "")
                     logger.info(f"✅ Composite egress started: {_active_egress[room_name]} | room={room_name}")
                     logger.info(f"📁 Recording → {result.get('s3_url', '')}")
             except Exception as e:
@@ -220,6 +222,19 @@ async def _on_egress_ended(room_name: str, event: dict) -> None:
     # Notify SSE subscribers — include status so frontend can handle ABORTED.
     for queue in _sse_subscribers.get(room_name, []):
         await queue.put({"event": "egress_ended", "session_id": room_name, "status": status})
+
+
+async def _on_room_finished(room_name: str) -> None:
+    """Stop the composite egress when the room ends to get EGRESS_COMPLETE instead of EGRESS_ABORTED."""
+    egress_id = _active_egress.get(room_name)
+    if not egress_id:
+        logger.info(f"🚪 Room finished: no active composite egress for {room_name}")
+        return
+    logger.info(f"🛑 Stopping composite egress {egress_id} for finished room {room_name}")
+    try:
+        await stop_egress(egress_id=egress_id, room_name=room_name)
+    except Exception as e:
+        logger.error(f"❌ Failed to stop composite egress {egress_id}: {e}", exc_info=True)
 
 
 def subscribe_sse(room_name: str) -> asyncio.Queue:
