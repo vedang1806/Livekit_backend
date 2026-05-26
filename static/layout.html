@@ -61,7 +61,7 @@
   <script>
     const params  = new URLSearchParams(location.search);
     const wsURL   = params.get('url');
-    const token   = params.get('access_token');
+    const token   = params.get('token') || params.get('access_token');
     const grid    = document.getElementById('grid');
     const tiles   = {};   // identity → tile element
 
