@@ -26,11 +26,19 @@ from egress import start_composite_egress, start_track_egress, list_egress, stop
 logger = logging.getLogger(__name__)
 
 # Composite egress per room — prevents duplicate room-level recordings.
-_active_egress: dict[str, str] = {}          # room_name → egress_id
+_active_egress: dict[str, str] = {}          # room_name → composite_egress_id
 
 # Track-level egresses — prevents duplicate per-participant audio recordings.
 # Key: (room_name, track_sid)
 _active_track_egress: set[tuple] = set()
+
+# Maps track egress_id → room_name so we know when ALL track egresses for a
+# room are done and can stop the composite before the room is destroyed.
+_track_egress_id_to_room: dict[str, str] = {}
+
+# Cancelable delayed composite-stop tasks — keyed by room_name.
+# Cancelled if a new participant publishes audio before the delay expires.
+_pending_composite_stop: dict[str, asyncio.Task] = {}
 
 # Deduplication: egress IDs we've already processed egress_ended for.
 _ended_egress_ids: set[str] = set()
@@ -181,6 +189,12 @@ async def _on_track_published(room_name: str, event: dict) -> None:
             logger.info(f"⊘ OGG already recording for {track_sid}")
             return
 
+        # Cancel any pending composite stop — a new participant is joining.
+        pending = _pending_composite_stop.pop(room_name, None)
+        if pending:
+            pending.cancel()
+            logger.info(f"🔄 New track in {room_name}, cancelled pending composite stop")
+
         logger.info(f"🎙️  Starting OGG for participant: {identity} ({track_sid})")
         try:
             result = await start_track_egress(
@@ -190,6 +204,9 @@ async def _on_track_published(room_name: str, event: dict) -> None:
                 identity=identity,
             )
             _active_track_egress.add(key)
+            track_egress_id = result.get("egressId") or result.get("egress_id", "")
+            if track_egress_id:
+                _track_egress_id_to_room[track_egress_id] = room_name
             logger.info(f"✅ OGG recording started → s3://{settings.s3_bucket}/{result.get('s3_key', '')}")
         except Exception as e:
             logger.error(f"❌ Track egress FAILED for {identity} ({track_sid}): {e}", exc_info=True)
@@ -209,32 +226,74 @@ async def _on_egress_ended(room_name: str, event: dict) -> None:
         return
     _ended_egress_ids.add(egress_id)
 
-    # Only clear the composite ref if this egress IS the composite for the room.
-    if _active_egress.get(room_name) == egress_id:
+    is_composite = (_active_egress.get(room_name) == egress_id)
+    is_track     = (egress_id in _track_egress_id_to_room)
+
+    if is_composite:
         _active_egress.pop(room_name, None)
 
-    # Clear per-participant track egresses for the room on any egress end.
-    stale = {key for key in _active_track_egress if key[0] == room_name}
-    _active_track_egress.difference_update(stale)
+    if is_track:
+        _track_egress_id_to_room.pop(egress_id, None)
+        # Check if all track egresses for this room are now done.
+        remaining = [eid for eid, rn in _track_egress_id_to_room.items() if rn == room_name]
+        if not remaining and room_name in _active_egress:
+            composite_id = _active_egress[room_name]
+            logger.info(f"🏁 Last track egress done for {room_name} — scheduling composite stop in 10s")
+            task = asyncio.create_task(_delayed_stop_composite(room_name, composite_id))
+            _pending_composite_stop[room_name] = task
 
     logger.info(f"Egress ended: {egress_id} | room={room_name} | status={status}")
 
-    # Notify SSE subscribers — include status so frontend can handle ABORTED.
-    for queue in _sse_subscribers.get(room_name, []):
-        await queue.put({"event": "egress_ended", "session_id": room_name, "status": status})
+    # Notify SSE subscribers only when composite ends (that's the signal the session is fully saved).
+    if is_composite:
+        for queue in _sse_subscribers.get(room_name, []):
+            await queue.put({"event": "egress_ended", "session_id": room_name, "status": status})
 
 
-async def _on_room_finished(room_name: str) -> None:
-    """Stop the composite egress when the room ends to get EGRESS_COMPLETE instead of EGRESS_ABORTED."""
-    egress_id = _active_egress.get(room_name)
-    if not egress_id:
-        logger.info(f"🚪 Room finished: no active composite egress for {room_name}")
-        return
-    logger.info(f"🛑 Stopping composite egress {egress_id} for finished room {room_name}")
+async def _stop_composite(room_name: str, egress_id: str) -> None:
+    """Stop the composite egress so LiveKit finalizes the MP4 cleanly (EGRESS_COMPLETE)."""
+    logger.info(f"🛑 Stopping composite {egress_id} for room {room_name}")
     try:
         await stop_egress(egress_id=egress_id, room_name=room_name)
     except Exception as e:
         logger.error(f"❌ Failed to stop composite egress {egress_id}: {e}", exc_info=True)
+
+
+async def _delayed_stop_composite(room_name: str, egress_id: str, delay: float = 10.0) -> None:
+    """
+    Stop composite after `delay` seconds, unless cancelled by a new participant.
+    Must be called while the room is still alive (before room_finished) so LiveKit
+    can finalize the MP4 cleanly. departureTimeout=20s gives us the window.
+    """
+    await asyncio.sleep(delay)
+    _pending_composite_stop.pop(room_name, None)
+    # Guard: composite may have already ended (e.g. deduplication or restart)
+    if _active_egress.get(room_name) != egress_id:
+        logger.info(f"⊘ Delayed composite stop skipped for {room_name} — already cleared")
+        return
+    await _stop_composite(room_name, egress_id)
+
+
+async def _on_room_finished(room_name: str) -> None:
+    """
+    Clean up in-memory state when the room is destroyed.
+    Do NOT call stop_egress here — by the time room_finished fires the room is
+    being torn down, and any stop produces EGRESS_ABORTED instead of EGRESS_COMPLETE.
+    The composite should already be stopped by _delayed_stop_composite.
+    """
+    # Cancel the delayed stop if it hasn't fired yet (room gone, nothing to finalize).
+    pending = _pending_composite_stop.pop(room_name, None)
+    if pending:
+        pending.cancel()
+        logger.info(f"🚪 Room finished: cancelled pending composite stop for {room_name}")
+
+    _active_egress.pop(room_name, None)
+    stale_tracks = {key for key in _active_track_egress if key[0] == room_name}
+    _active_track_egress.difference_update(stale_tracks)
+    stale_ids = {eid for eid, rn in _track_egress_id_to_room.items() if rn == room_name}
+    for eid in stale_ids:
+        _track_egress_id_to_room.pop(eid, None)
+    logger.info(f"🚪 Room finished: state cleared for {room_name}")
 
 
 def subscribe_sse(room_name: str) -> asyncio.Queue:
@@ -251,7 +310,13 @@ def unsubscribe_sse(room_name: str, queue: asyncio.Queue) -> None:
 
 
 def clear_active_egress(room_name: str) -> None:
-    """Call this from /egress/stop so the in-memory set stays consistent."""
+    """Call this from /egress/stop so the in-memory state stays consistent."""
+    pending = _pending_composite_stop.pop(room_name, None)
+    if pending:
+        pending.cancel()
     _active_egress.pop(room_name, None)
-    stale = {key for key in _active_track_egress if key[0] == room_name}
-    _active_track_egress.difference_update(stale)
+    stale_tracks = {key for key in _active_track_egress if key[0] == room_name}
+    _active_track_egress.difference_update(stale_tracks)
+    stale_ids = {eid for eid, rn in _track_egress_id_to_room.items() if rn == room_name}
+    for eid in stale_ids:
+        _track_egress_id_to_room.pop(eid, None)

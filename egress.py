@@ -216,7 +216,7 @@ async def start_track_egress(
     Called automatically on track_published (AUDIO) webhook events.
     S3 path: sessions/{session_id}/audio/{identity}.ogg
     """
-    s3_key = f"sessions/{session_id}/audio/{identity}.ogg"
+    s3_key = f"TEMP/sessions/{session_id}/audio/{identity}.ogg"
     url    = f"{_http_base()}/twirp/livekit.Egress/StartTrackEgress"
     body   = {
         "room_name": room_name,
@@ -248,7 +248,7 @@ async def get_recording_presigned_url(session_id: str, expires_in: int = 3600) -
     (egress still running or upload in progress).
     """
     def _blocking_get_url():
-        s3_key = f"sessions/{session_id}/composite_recording.mp4"
+        s3_key = f"TEMP/sessions/{session_id}/composite_recording.mp4"
         s3_client = boto3.client(
             "s3",
             region_name=settings.aws_region,
