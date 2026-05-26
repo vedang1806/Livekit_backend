@@ -137,11 +137,7 @@ async def start_composite_egress(
         "room_name":  room_name,
         "audio_only": audio_only,
     }
-    if custom_url:
-        layout_url = f"{custom_url}/static/layout.html?ngrok-skip-browser-warning=true"
-        body["custom_base_url"] = layout_url
-    else:
-        body["layout"] = "grid-dark"
+    body["layout"] = "grid-dark"
 
     body["file_outputs"] = [{
         "file_type": file_type,
