@@ -37,6 +37,8 @@ from models import (
     ParticipantsResponse,
     RecordingUrlResponse,
     ParticipantRecordingsResponse,
+    SessionRecording,
+    SessionRecordingsResponse,
     HealthResponse,
 )
 
@@ -238,7 +240,7 @@ async def egress_status(session_id: str = Query(...)):
         livekit_status = f"error: {e}"
 
     # ── 2. Check S3 file ──────────────────────────────────────────────────────
-    s3_key  = f"sessions/{session_id}/composite_recording.mp4"
+    s3_key  = f"TEMP/sessions/{session_id}/composite_recording.mp4"
     s3      = boto3.client(
         "s3",
         region_name=settings.aws_region,
@@ -293,6 +295,83 @@ async def egress_recording_url(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/egress/session-recordings", response_model=SessionRecordingsResponse, tags=["egress"])
+async def session_recordings(
+    session_id: str = Query(...),
+    expires_in: int = Query(3600, description="Presigned URL TTL in seconds (max 604800)"),
+):
+    """
+    Returns presigned S3 URLs for ALL recordings from a session in one call:
+      - composite: the full grid MP4 (TEMP/sessions/{id}/composite_recording.mp4)
+      - audio[]:   per-participant OGG files  (TEMP/sessions/{id}/audio/{identity}.ogg)
+      - video[]:   per-participant WebM files (TEMP/sessions/{id}/video/{identity}.webm)
+
+    Call this after egress has ended. Any missing file type is simply omitted rather
+    than returning a 404 — check the composite / audio / video fields individually.
+    """
+    import boto3
+    from botocore.exceptions import ClientError as BotoClientError
+
+    s3 = boto3.client(
+        "s3",
+        region_name=settings.aws_region,
+        aws_access_key_id=settings.aws_access_key,
+        aws_secret_access_key=settings.aws_secret_key,
+    )
+
+    def presign(key: str) -> str:
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.s3_bucket, "Key": key},
+            ExpiresIn=expires_in,
+        )
+
+    # List everything under TEMP/sessions/{session_id}/
+    prefix = f"TEMP/sessions/{session_id}/"
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        keys: list[str] = []
+        for page in paginator.paginate(Bucket=settings.s3_bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                keys.append(obj["Key"])
+    except BotoClientError as e:
+        raise HTTPException(status_code=500, detail=f"S3 list error: {e}")
+
+    composite_rec: SessionRecording | None = None
+    audio_recs:    list[SessionRecording] = []
+    video_recs:    list[SessionRecording] = []
+
+    for key in keys:
+        tail = key[len(prefix):]  # e.g. "composite_recording.mp4" or "audio/doctor_1.ogg"
+        try:
+            url = presign(key)
+        except BotoClientError:
+            continue
+
+        if tail == "composite_recording.mp4":
+            composite_rec = SessionRecording(
+                kind="composite", identity="", s3_key=key, url=url, expires_in=expires_in
+            )
+        elif tail.startswith("audio/") and tail.endswith(".ogg"):
+            identity = tail[len("audio/"):-len(".ogg")]
+            audio_recs.append(SessionRecording(
+                kind="audio", identity=identity, s3_key=key, url=url, expires_in=expires_in
+            ))
+        elif tail.startswith("video/") and tail.endswith(".webm"):
+            identity = tail[len("video/"):-len(".webm")]
+            video_recs.append(SessionRecording(
+                kind="video", identity=identity, s3_key=key, url=url, expires_in=expires_in
+            ))
+
+    return SessionRecordingsResponse(
+        session_id=session_id,
+        composite=composite_rec,
+        audio=audio_recs,
+        video=video_recs,
+        expires_in=expires_in,
+    )
+
+
 @app.get("/egress/participant-recordings", tags=["egress"])
 async def participant_recordings(
     session_id: str = Query(...),
@@ -300,28 +379,28 @@ async def participant_recordings(
 ):
     """
     Get presigned URLs for all per-participant OGG recordings.
-    
+
     Each participant's audio is recorded separately with their identity in the filename.
     This endpoint returns all of them with their role (parsed from participant name).
-    
+
     Frontend can display these side-by-side with role labels to show who's speaking when.
-    
+
     Returns 404 if no recordings exist yet (egress still running or no audio tracks published).
     """
     try:
         import boto3
         from botocore.exceptions import ClientError
         from models import ParticipantRecording, ParticipantRecordingsResponse
-        
-        # List S3 objects matching sessions/{session_id}/audio/*.ogg
+
+        # List S3 objects matching TEMP/sessions/{session_id}/audio/*.ogg
         s3_client = boto3.client(
             "s3",
             region_name=settings.aws_region,
             aws_access_key_id=settings.aws_access_key,
             aws_secret_access_key=settings.aws_secret_key,
         )
-        
-        prefix = f"sessions/{session_id}/audio/"
+
+        prefix = f"TEMP/sessions/{session_id}/audio/"
         try:
             resp = s3_client.list_objects_v2(Bucket=settings.s3_bucket, Prefix=prefix)
         except ClientError as e:

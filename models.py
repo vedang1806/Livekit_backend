@@ -86,6 +86,21 @@ class ParticipantRecordingsResponse(BaseModel):
     recordings:  List[ParticipantRecording]  # one per participant
     expires_in:  int
 
+class SessionRecording(BaseModel):
+    kind:       str   # "composite" | "audio" | "video"
+    identity:   str   # participant identity, empty string for composite
+    s3_key:     str
+    url:        str
+    expires_in: int
+
+class SessionRecordingsResponse(BaseModel):
+    session_id:  str
+    composite:   Optional[SessionRecording]
+    audio:       List[SessionRecording]
+    video:       List[SessionRecording]
+    expires_in:  int
+
+
 class HealthResponse(BaseModel):
     status:      str
     livekit_url: str
