@@ -137,12 +137,11 @@ async def start_composite_egress(
         "room_name":  room_name,
         "audio_only": audio_only,
     }
-    # grid-dark is LiveKit's built-in layout. It reliably reaches EGRESS_ACTIVE
-    # and displays participant names from their JWT 'name' field.
-    # Custom layout (custom_base_url) never reached EGRESS_ACTIVE in testing —
-    # LiveKit's Chromium recorder requires playing MediaStream in <video> elements
-    # to start recording; HTML-only content is not sufficient.
-    body["layout"] = "grid-dark"
+    if custom_url:
+        layout_url = f"{custom_url}/static/layout.html?ngrok-skip-browser-warning=true"
+        body["custom_base_url"] = layout_url
+    else:
+        body["layout"] = "grid-dark"
 
     body["file_outputs"] = [{
         "file_type": file_type,

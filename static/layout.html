@@ -146,12 +146,38 @@
       if (entry) track.detach(entry.video);
     }
 
+    // Seed a canvas-backed video stream into a hidden <video> element so
+    // Chromium's media pipeline sees an active MediaStream immediately on load.
+    // Without this, LiveKit's composite egress never fires EGRESS_ACTIVE because
+    // it waits for at least one playing video source before starting the recording.
+    function seedMediaPipeline() {
+      const canvas  = document.createElement('canvas');
+      canvas.width  = 2;
+      canvas.height = 2;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#111';
+      ctx.fillRect(0, 0, 2, 2);
+      // Redraw every 100ms so the stream stays "live" (static canvas stalls)
+      setInterval(() => { ctx.fillRect(0, 0, 2, 2); }, 100);
+      const stream = canvas.captureStream(10);
+      const seed   = document.createElement('video');
+      seed.srcObject  = stream;
+      seed.autoplay   = true;
+      seed.muted      = true;
+      seed.playsInline = true;
+      seed.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0.01;pointer-events:none';
+      document.body.appendChild(seed);
+      seed.play().catch(() => {});
+    }
+
     async function main() {
       if (!wsURL || !token) {
         document.title = 'ERROR: missing url/token';
         console.error('[layout] missing url or token — url=' + wsURL + ' token=' + (token ? 'ok' : 'MISSING'));
         return;
       }
+
+      seedMediaPipeline();
 
       const room = new LivekitClient.Room({
         adaptiveStream: false,
