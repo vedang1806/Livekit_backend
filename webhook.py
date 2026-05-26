@@ -1,11 +1,12 @@
 """
 webhook.py — LiveKit webhook handler.
 
-Key design decisions:
-- Composite egress auto-terminates when room empties (departureTimeout) → EGRESS_COMPLETE
-- Never manually stop composite — it causes EGRESS_ABORTED
-- Track egresses end naturally when participants leave
-- SSE notification fires on composite egress_ended
+Egress lifecycle for custom layout composite:
+  - Composite must be manually stopped to get EGRESS_COMPLETE
+  - Stop window: after last participant_left, before room_finished
+  - We listen to participant_left, count active participants,
+    and stop composite when count reaches 0
+  - departureTimeout=20s gives us the window
 """
 
 import asyncio
@@ -19,39 +20,28 @@ import jwt as pyjwt
 from fastapi import HTTPException, Request
 
 from config import settings
-from egress import list_egress, start_composite_egress, start_track_egress
+from egress import list_egress, start_composite_egress, start_track_egress, stop_egress
 
 logger = logging.getLogger(__name__)
 
 # ── In-memory state ──────────────────────────────────────────────────────────
-# NOTE: All state is lost on server restart. For production, use Redis.
 
-# room_name → composite_egress_id
-# Kept alive until egress_ended fires so SSE notification works correctly.
-_active_egress: dict[str, str] = {}
+_active_egress: dict[str, str] = {}           # room_name → composite_egress_id
+_active_track_egress: set[tuple] = set()      # (room_name, track_sid)
+_track_egress_id_to_room: dict[str, str] = {} # track_egress_id → room_name
+_ended_egress_ids: set[str] = set()           # dedup
+_sse_subscribers: dict[str, list] = {}        # room_name → [Queue]
+_finished_rooms: set[str] = set()             # rooms fully destroyed
 
-# (room_name, track_sid) — prevents duplicate per-track egress
-_active_track_egress: set[tuple] = set()
+# Active (human) participants per room — set is idempotent against duplicate webhooks.
+# LiveKit fires participant_left twice (two edge IPs); a set handles that safely.
+_active_participants: dict[str, set] = {}     # room_name → {identity, ...}
 
-# track_egress_id → room_name
-_track_egress_id_to_room: dict[str, str] = {}
-
-# Dedup: egress IDs already processed
-_ended_egress_ids: set[str] = set()
-
-# SSE: room_name → [asyncio.Queue]
-_sse_subscribers: dict[str, list] = {}
-
-# Rooms fully destroyed — guards against late-arriving track_published webhooks
-_finished_rooms: set[str] = set()
-
-# ── LiveKit track type/source constants (webhook sends strings) ───────────────
 _AUDIO_TYPES = {"AUDIO"}
 _AUDIO_SOURCES = {"MICROPHONE", "SCREEN_SHARE_AUDIO"}
 
 
 def verify_livekit_signature(body: bytes, auth_header: str) -> bool:
-    """Verify LiveKit JWT webhook signature."""
     try:
         claims = pyjwt.decode(
             auth_header.strip(),
@@ -67,7 +57,6 @@ def verify_livekit_signature(body: bytes, auth_header: str) -> bool:
 
 
 async def handle_livekit_webhook(request: Request) -> dict:
-    """Verify, parse, and dispatch webhook events. Always returns 200 immediately."""
     body = await request.body()
     auth_header = request.headers.get("Authorization", "")
 
@@ -91,32 +80,85 @@ async def handle_livekit_webhook(request: Request) -> dict:
 
     logger.info(f"LiveKit webhook: {event_type} | room={room_name}")
 
-    dispatch = {
-        "track_published": lambda: asyncio.create_task(
-            _on_track_published(room_name, event)
-        ),
-        "egress_ended": lambda: asyncio.create_task(
-            _on_egress_ended(room_name, event)
-        ),
-        "room_finished": lambda: asyncio.create_task(
-            _on_room_finished(room_name)
-        ),
-    }
-
-    handler = dispatch.get(event_type)
-    if handler:
-        handler()
+    if event_type == "track_published":
+        asyncio.create_task(_on_track_published(room_name, event))
+    elif event_type == "participant_joined":
+        asyncio.create_task(_on_participant_joined(room_name, event))
+    elif event_type == "participant_left":
+        asyncio.create_task(_on_participant_left(room_name, event))
+    elif event_type == "egress_ended":
+        logger.info(f"🏁 Queuing _on_egress_ended for {room_name}")
+        asyncio.create_task(_on_egress_ended(room_name, event))
+    elif event_type == "room_finished":
+        asyncio.create_task(_on_room_finished(room_name))
     else:
         logger.debug(f"⊘ Ignoring event: {event_type}")
 
     return {"received": True}
 
 
+async def _on_participant_joined(room_name: str, event: dict) -> None:
+    """Track active participants. Egress recorder participants (identity starts with EG_) excluded."""
+    participant = event.get("participant", {})
+    identity = participant.get("identity", "")
+
+    if identity.startswith("EG_"):
+        logger.debug(f"⊘ Egress participant joined (excluded): {identity}")
+        return
+
+    _active_participants.setdefault(room_name, set()).add(identity)
+    count = len(_active_participants[room_name])
+    logger.info(f"👤 Participant joined: {identity} | active={count} | room={room_name}")
+
+
+async def _on_participant_left(room_name: str, event: dict) -> None:
+    """
+    Remove participant from active set. When set is empty, stop composite egress.
+    Using a set means duplicate participant_left webhooks (LiveKit sends from 2 IPs)
+    are idempotent — removing the same identity twice still leaves an empty set.
+    """
+    participant = event.get("participant", {})
+    identity = participant.get("identity", "")
+
+    if identity.startswith("EG_"):
+        logger.debug(f"⊘ Egress participant left (excluded): {identity}")
+        return
+
+    participants = _active_participants.get(room_name, set())
+    participants.discard(identity)
+    remaining = len(participants)
+
+    logger.info(f"👤 Participant left: {identity} | remaining={remaining} | room={room_name}")
+
+    if remaining == 0:
+        logger.info(f"🏁 Last participant left {room_name} — stopping composite now")
+        asyncio.create_task(_stop_composite_for_room(room_name))
+
+
+async def _stop_composite_for_room(room_name: str) -> None:
+    """
+    Stop composite egress while the room is still alive.
+    Called immediately when last participant leaves — gives EGRESS_COMPLETE.
+    departureTimeout=20s means we have ~20s before room_finished fires.
+    """
+    egress_id = _active_egress.get(room_name)
+    if not egress_id:
+        logger.info(f"⊘ No active composite to stop for {room_name}")
+        return
+
+    if room_name in _finished_rooms:
+        logger.warning(f"⚠️  Room {room_name} already finished — too late to stop cleanly")
+        return
+
+    logger.info(f"🛑 Stopping composite {egress_id} for {room_name}")
+    try:
+        await stop_egress(egress_id=egress_id, room_name=room_name)
+        logger.info(f"✅ stop_egress called for {egress_id} — expecting EGRESS_COMPLETE shortly")
+    except Exception as e:
+        logger.error(f"❌ stop_egress failed for {egress_id}: {e}", exc_info=True)
+
+
 async def _on_track_published(room_name: str, event: dict) -> None:
-    """
-    Start composite (once per room) and per-participant OGG on every audio track.
-    Fires after track is live — no delay needed.
-    """
     try:
         if not room_name:
             logger.warning("⚠️  _on_track_published: missing room_name")
@@ -138,7 +180,6 @@ async def _on_track_published(room_name: str, event: dict) -> None:
             f"sid={track_sid} participant={identity}"
         )
 
-        # ✅ Correct audio detection — strings only, no ints
         is_audio = track_type in _AUDIO_TYPES or track_source in _AUDIO_SOURCES
         if not is_audio:
             logger.info(f"⊘ Non-audio track skipped: type={track_type} source={track_source}")
@@ -146,11 +187,9 @@ async def _on_track_published(room_name: str, event: dict) -> None:
 
         logger.info("✅ Audio track confirmed — proceeding with egress")
 
-        # ── 1. Composite egress (once per room) ──────────────────────────────
         if room_name not in _active_egress:
             await _ensure_composite_egress(room_name)
 
-        # ── 2. Per-participant OGG track egress ───────────────────────────────
         await _ensure_track_egress(room_name, track_sid, identity)
 
     except Exception as e:
@@ -158,18 +197,16 @@ async def _on_track_published(room_name: str, event: dict) -> None:
 
 
 async def _ensure_composite_egress(room_name: str) -> None:
-    """Start composite egress for a room if not already running."""
     try:
         existing = await list_egress(room_name=room_name)
         running = [
             e for e in existing.get("items", [])
             if e.get("status") in ("EGRESS_STARTING", "EGRESS_ACTIVE")
-            # Only match composite egress (not track egress)
             and e.get("sourceType") != "EGRESS_SOURCE_TYPE_SDK"
         ]
         if running:
             _active_egress[room_name] = running[0].get("egressId", "")
-            logger.info(f"✓ Composite already running for {room_name}: {_active_egress[room_name]}")
+            logger.info(f"✓ Composite already running: {_active_egress[room_name]}")
             return
 
         result = await start_composite_egress(
@@ -186,7 +223,6 @@ async def _ensure_composite_egress(room_name: str) -> None:
 
 
 async def _ensure_track_egress(room_name: str, track_sid: str, identity: str) -> None:
-    """Start OGG track egress for a participant if not already running."""
     key = (room_name, track_sid)
     if key in _active_track_egress:
         logger.info(f"⊘ OGG already active for track {track_sid}")
@@ -212,15 +248,6 @@ async def _ensure_track_egress(room_name: str, track_sid: str, identity: str) ->
 
 
 async def _on_egress_ended(room_name: str, event: dict) -> None:
-    """
-    Handle egress_ended for both composite and track egresses.
-
-    Composite egress lifecycle:
-      All participants leave → departureTimeout (20s) → room_finished
-      → LiveKit auto-terminates composite → egress_ended(EGRESS_COMPLETE)
-
-    We never manually stop composite — that causes EGRESS_ABORTED.
-    """
     egress_info = event.get("egressInfo", {})
     egress_id = egress_info.get("egressId", "")
     status = egress_info.get("status", "")
@@ -239,19 +266,16 @@ async def _on_egress_ended(room_name: str, event: dict) -> None:
     )
 
     if is_composite:
-        # ✅ Clean up composite state AFTER confirming egress_ended
         _active_egress.pop(room_name, None)
 
         if status == "EGRESS_COMPLETE":
-            logger.info(f"🎬 Composite recording finalized for {room_name}")
+            logger.info(f"🎬 Composite recording saved for {room_name} ✅")
         else:
-            # EGRESS_ABORTED means MP4 may be corrupt — log clearly
             logger.error(
-                f"🚨 Composite egress ABORTED for {room_name} — "
-                f"MP4 may be incomplete. Status: {status}"
+                f"🚨 Composite ABORTED for {room_name} — "
+                f"MP4 incomplete. Status: {status}"
             )
 
-        # Notify SSE subscribers — recording is saved (or failed)
         for queue in _sse_subscribers.get(room_name, []):
             await queue.put({
                 "event": "egress_ended",
@@ -269,40 +293,41 @@ async def _on_egress_ended(room_name: str, event: dict) -> None:
             f"🎙️  Track egress done: {egress_id} | "
             f"remaining for {room_name}: {remaining_count}"
         )
-        # ✅ Do NOT stop composite here.
-        # Participants leaving ≠ session over.
-        # Composite auto-terminates when room_finished fires.
 
 
 async def _on_room_finished(room_name: str) -> None:
     """
-    Room is fully destroyed (all participants left + departureTimeout expired).
-
-    At this point LiveKit has already auto-terminated the composite egress.
-    We will receive egress_ended(EGRESS_COMPLETE) shortly after.
-
-    All we do here is mark the room finished and clean up track state.
-    We intentionally keep _active_egress[room_name] intact so that the
-    incoming egress_ended can still match is_composite=True and fire SSE.
+    Room fully destroyed. By now composite should already be stopped
+    (we called stop_egress on participant_left when count hit 0).
+    Just clean up state.
     """
     _finished_rooms.add(room_name)
 
-    # Clean up track egress state (track egresses already ended via egress_ended)
+    # Safety net: if composite still running (e.g. stop_egress failed),
+    # try once more — may still get ABORTED but worth trying
+    egress_id = _active_egress.get(room_name)
+    if egress_id:
+        logger.warning(
+            f"⚠️  room_finished but composite {egress_id} still active — "
+            f"stop_egress may have failed earlier. Trying again (may ABORT)."
+        )
+        try:
+            await stop_egress(egress_id=egress_id, room_name=room_name)
+        except Exception as e:
+            logger.error(f"❌ Safety-net stop_egress failed: {e}", exc_info=True)
+
+    _cleanup_room_state(room_name)
+    logger.info(f"🚪 Room finished and cleaned up: {room_name}")
+
+
+def _cleanup_room_state(room_name: str) -> None:
+    _active_participants.pop(room_name, None)
+    _active_egress.pop(room_name, None)
     stale_track_keys = {k for k in _active_track_egress if k[0] == room_name}
     _active_track_egress.difference_update(stale_track_keys)
-
-    stale_egress_ids = {
-        eid for eid, rn in _track_egress_id_to_room.items() if rn == room_name
-    }
-    for eid in stale_egress_ids:
+    stale_ids = {eid for eid, rn in _track_egress_id_to_room.items() if rn == room_name}
+    for eid in stale_ids:
         _track_egress_id_to_room.pop(eid, None)
-
-    logger.info(
-        f"🚪 Room finished: {room_name} — composite will auto-finalize, "
-        f"waiting for egress_ended"
-    )
-    # NOTE: _active_egress[room_name] intentionally NOT cleared here.
-    # It must survive until egress_ended fires so is_composite check works.
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -320,14 +345,6 @@ def unsubscribe_sse(room_name: str, queue: asyncio.Queue) -> None:
 
 
 def clear_active_egress(room_name: str) -> None:
-    """
-    Called from manual /egress/stop endpoint.
-    Only use this if you have a 'Stop Recording' button in your UI.
-    """
-    _active_egress.pop(room_name, None)
-    stale_tracks = {k for k in _active_track_egress if k[0] == room_name}
-    _active_track_egress.difference_update(stale_tracks)
-    stale_ids = {eid for eid, rn in _track_egress_id_to_room.items() if rn == room_name}
-    for eid in stale_ids:
-        _track_egress_id_to_room.pop(eid, None)
+    """Manual stop from /egress/stop endpoint."""
+    _cleanup_room_state(room_name)
     _finished_rooms.discard(room_name)
