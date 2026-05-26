@@ -25,12 +25,32 @@
       position: relative;
       background: #222;
       overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .tile video {
       width: 100%;
       height: 100%;
       object-fit: cover;
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+
+    .avatar {
+      width: 160px;
+      height: 160px;
+      border-radius: 50%;
+      background: #1a3a5c;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 72px;
+      color: #4fc3f7;
+      font-weight: 700;
+      flex-shrink: 0;
     }
 
     .name-label {
@@ -45,6 +65,7 @@
       font-weight: 700;
       letter-spacing: 2px;
       text-shadow: 0 2px 6px rgba(0,0,0,0.9);
+      z-index: 1;
     }
 
     .name-label .role {
@@ -73,21 +94,33 @@
 
     function addTile(participant) {
       if (tiles[participant.identity]) return;
-      const tile  = document.createElement('div');
+
+      const tile = document.createElement('div');
       tile.className = 'tile';
+
+      // Avatar placeholder — visible immediately even before video subscribes.
+      // This ensures Chromium renders content so the recording pipeline starts.
+      const avatar = document.createElement('div');
+      avatar.className = 'avatar';
+      const displayName = participant.name || participant.identity || '?';
+      avatar.textContent = displayName[0].toUpperCase();
+
       const video = document.createElement('video');
-      video.autoplay = true;
-      video.muted    = true;
+      video.autoplay    = true;
+      video.muted       = true;
       video.playsInline = true;
+
       const label = document.createElement('div');
       label.className = 'name-label';
-      const name = participant.name || participant.identity;
-      label.innerHTML = `<span class="role">${name}</span>`;
+      label.innerHTML = `<span class="role">${displayName}</span>`;
+
+      tile.appendChild(avatar);
       tile.appendChild(video);
       tile.appendChild(label);
       grid.appendChild(tile);
-      tiles[participant.identity] = { tile, video };
+      tiles[participant.identity] = { tile, video, avatar };
       setGridLayout(Object.keys(tiles).length);
+      console.log('[layout] tile added:', participant.identity);
     }
 
     function removeTile(participant) {
@@ -100,43 +133,61 @@
     }
 
     function attachTrack(participant, track) {
+      if (track.kind !== 'video') return;
+      if (!tiles[participant.identity]) addTile(participant);
       const entry = tiles[participant.identity];
-      if (!entry || track.kind !== 'video') return;
       track.attach(entry.video);
+      console.log('[layout] video attached:', participant.identity);
+    }
+
+    function detachTrack(participant, track) {
+      if (track.kind !== 'video') return;
+      const entry = tiles[participant.identity];
+      if (entry) track.detach(entry.video);
     }
 
     async function main() {
       if (!wsURL || !token) {
         document.body.style.background = 'red';
-        throw new Error('Missing url or token params: url=' + wsURL + ' token=' + (token ? 'ok' : 'MISSING'));
+        document.body.innerHTML = '<div style="color:#fff;font-size:48px;padding:40px">ERROR: Missing url or token params</div>';
+        throw new Error('Missing url or token — url=' + wsURL + ' token=' + (token ? 'ok' : 'MISSING'));
       }
 
       const room = new LivekitClient.Room({
         adaptiveStream: false,
-        dynacast: false,
+        dynacast:       false,
       });
 
-      room.on(LivekitClient.RoomEvent.ParticipantConnected, addTile);
+      room.on(LivekitClient.RoomEvent.ParticipantConnected,    addTile);
       room.on(LivekitClient.RoomEvent.ParticipantDisconnected, removeTile);
       room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+        console.log('[layout] TrackSubscribed', track.kind, participant.identity);
         addTile(participant);
         attachTrack(participant, track);
       });
+      room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track, _pub, participant) => {
+        detachTrack(participant, track);
+      });
 
-      await room.connect(wsURL, token);
+      console.log('[layout] connecting to', wsURL);
+      await room.connect(wsURL, token, { autoSubscribe: true });
+      console.log('[layout] connected, remoteParticipants:', room.remoteParticipants.size);
 
-      // Render participants already in the room when egress joins
+      // Render participants already present when egress joins
       room.remoteParticipants.forEach((p) => {
+        console.log('[layout] existing participant:', p.identity);
         addTile(p);
         p.trackPublications.forEach((pub) => {
-          if (pub.track) attachTrack(p, pub.track);
+          if (pub.isSubscribed && pub.track) attachTrack(p, pub.track);
         });
       });
     }
 
     main().catch((err) => {
-      console.error('[layout] Fatal error:', err);
+      console.error('[layout] fatal error:', err);
       document.title = 'ERROR: ' + err.message;
+      document.body.style.background = '#7b0000';
+      document.body.innerHTML = `<div style="color:#fff;font-size:36px;padding:40px">LAYOUT ERROR: ${err.message}</div>`;
     });
   </script>
 </body>
