@@ -126,7 +126,7 @@ async def start_composite_egress(
     """
     file_type = "OGG" if audio_only else "MP4"
     extension = "ogg" if audio_only else "mp4"
-    s3_key    = f"sessions/{session_id}/composite_recording.{extension}"
+    s3_key    = f"TEMP/sessions/{session_id}/composite_recording.{extension}"
 
     url  = f"{_http_base()}/twirp/livekit.Egress/StartRoomCompositeEgress"
 
