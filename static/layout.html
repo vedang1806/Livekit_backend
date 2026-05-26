@@ -148,9 +148,9 @@
 
     async function main() {
       if (!wsURL || !token) {
-        document.body.style.background = 'red';
-        document.body.innerHTML = '<div style="color:#fff;font-size:48px;padding:40px">ERROR: Missing url or token params</div>';
-        throw new Error('Missing url or token — url=' + wsURL + ' token=' + (token ? 'ok' : 'MISSING'));
+        document.title = 'ERROR: missing url/token';
+        console.error('[layout] missing url or token — url=' + wsURL + ' token=' + (token ? 'ok' : 'MISSING'));
+        return;
       }
 
       const room = new LivekitClient.Room({
@@ -173,21 +173,27 @@
       await room.connect(wsURL, token, { autoSubscribe: true });
       console.log('[layout] connected, remoteParticipants:', room.remoteParticipants.size);
 
-      // Render participants already present when egress joins
-      room.remoteParticipants.forEach((p) => {
-        console.log('[layout] existing participant:', p.identity);
-        addTile(p);
-        p.trackPublications.forEach((pub) => {
-          if (pub.isSubscribed && pub.track) attachTrack(p, pub.track);
+      // Render participants already present when egress joins.
+      // Wrapped in try-catch so a single error here does NOT kill the page
+      // and destroy any tiles that were already rendered by the event handlers.
+      try {
+        room.remoteParticipants.forEach((p) => {
+          console.log('[layout] existing participant:', p.identity);
+          addTile(p);
+          p.trackPublications.forEach((pub) => {
+            if (pub.isSubscribed && pub.track) attachTrack(p, pub.track);
+          });
         });
-      });
+      } catch (err) {
+        console.error('[layout] error initializing existing participants:', err);
+      }
     }
 
     main().catch((err) => {
+      // Log only — do NOT modify body/innerHTML here so any tiles already
+      // rendered by event handlers are preserved for the recording pipeline.
       console.error('[layout] fatal error:', err);
       document.title = 'ERROR: ' + err.message;
-      document.body.style.background = '#7b0000';
-      document.body.innerHTML = `<div style="color:#fff;font-size:36px;padding:40px">LAYOUT ERROR: ${err.message}</div>`;
     });
   </script>
 </body>
