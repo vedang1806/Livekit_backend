@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 # ── In-memory state ──────────────────────────────────────────────────────────
 
 _active_egress: dict[str, str] = {}           # room_name → composite_egress_id
+_composite_ready: set[str] = set()            # room_names where composite is EGRESS_ACTIVE
+_pending_stop: set[str] = set()              # rooms waiting to stop once composite is active
 _active_track_egress: set[tuple] = set()      # (room_name, track_sid)
 _track_egress_id_to_room: dict[str, str] = {} # track_egress_id → room_name
 _ended_egress_ids: set[str] = set()           # dedup
@@ -91,6 +93,8 @@ async def handle_livekit_webhook(request: Request) -> dict:
         asyncio.create_task(_on_participant_joined(room_name, event))
     elif event_type == "participant_left":
         asyncio.create_task(_on_participant_left(room_name, event))
+    elif event_type == "egress_updated":
+        asyncio.create_task(_on_egress_updated(room_name, event))
     elif event_type == "egress_ended":
         logger.info(f"🏁 Queuing _on_egress_ended for {room_name}")
         asyncio.create_task(_on_egress_ended(room_name, event))
@@ -136,8 +140,13 @@ async def _on_participant_left(room_name: str, event: dict) -> None:
     logger.info(f"👤 Participant left: {identity} | remaining={remaining} | room={room_name}")
 
     if remaining == 0:
-        logger.info(f"🏁 Last participant left {room_name} — stopping composite now")
-        asyncio.create_task(_stop_composite_for_room(room_name))
+        if room_name in _composite_ready:
+            logger.info(f"🏁 Last participant left {room_name} — composite active, stopping now")
+            asyncio.create_task(_stop_composite_for_room(room_name))
+        elif room_name in _active_egress:
+            # Composite still starting up — defer stop until EGRESS_ACTIVE
+            _pending_stop.add(room_name)
+            logger.info(f"⏳ Last participant left {room_name} — composite still starting, deferring stop")
 
 
 async def _stop_composite_for_room(room_name: str) -> None:
@@ -252,6 +261,26 @@ async def _ensure_track_egress(room_name: str, track_sid: str, identity: str) ->
         logger.error(f"❌ Track egress FAILED for {identity} ({track_sid}): {e}", exc_info=True)
 
 
+async def _on_egress_updated(room_name: str, event: dict) -> None:
+    egress_info = event.get("egressInfo", {})
+    egress_id = egress_info.get("egressId", "")
+    status = egress_info.get("status", "")
+
+    # Only care about our composite for this room
+    if _active_egress.get(room_name) != egress_id:
+        return
+
+    logger.info(f"📡 Composite updated: {egress_id} → {status} | room={room_name}")
+
+    if status == "EGRESS_ACTIVE":
+        _composite_ready.add(room_name)
+        # If all participants already left, stop now
+        if room_name in _pending_stop:
+            _pending_stop.discard(room_name)
+            logger.info(f"🏁 Composite now active, executing deferred stop for {room_name}")
+            asyncio.create_task(_stop_composite_for_room(room_name))
+
+
 async def _on_egress_ended(room_name: str, event: dict) -> None:
     egress_info = event.get("egressInfo", {})
     egress_id = egress_info.get("egressId", "")
@@ -272,6 +301,8 @@ async def _on_egress_ended(room_name: str, event: dict) -> None:
 
     if is_composite:
         _active_egress.pop(room_name, None)
+        _composite_ready.discard(room_name)
+        _pending_stop.discard(room_name)
 
         if status == "EGRESS_COMPLETE":
             logger.info(f"🎬 Composite recording saved for {room_name} ✅")
@@ -328,6 +359,8 @@ async def _on_room_finished(room_name: str) -> None:
 def _cleanup_room_state(room_name: str) -> None:
     _active_participants.pop(room_name, None)
     _active_egress.pop(room_name, None)
+    _composite_ready.discard(room_name)
+    _pending_stop.discard(room_name)
     stale_track_keys = {k for k in _active_track_egress if k[0] == room_name}
     _active_track_egress.difference_update(stale_track_keys)
     stale_ids = {eid for eid, rn in _track_egress_id_to_room.items() if rn == room_name}
