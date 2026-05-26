@@ -137,13 +137,15 @@ async def start_composite_egress(
         "room_name":  room_name,
         "audio_only": audio_only,
     }
-    if custom_url:
-        # ngrok free tier shows a browser interstitial — skip it via query param.
-        # Harmless on non-ngrok hosts.
-        layout_url = f"{custom_url}/static/layout.html?ngrok-skip-browser-warning=true"
-        body["custom_base_url"] = layout_url
-    else:
-        body["layout"] = "grid-dark"
+    # DIAGNOSTIC: force built-in grid-dark to confirm composite egress reaches EGRESS_ACTIVE.
+    # Custom layout Chromium connects but recording pipeline never starts.
+    # Switch back to custom_base_url once this confirms composite works end-to-end.
+    body["layout"] = "grid-dark"
+    # if custom_url:
+    #     layout_url = f"{custom_url}/static/layout.html?ngrok-skip-browser-warning=true"
+    #     body["custom_base_url"] = layout_url
+    # else:
+    #     body["layout"] = "grid-dark"
 
     body["file_outputs"] = [{
         "file_type": file_type,
