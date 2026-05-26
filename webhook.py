@@ -80,7 +80,12 @@ async def handle_livekit_webhook(request: Request) -> dict:
 
     logger.info(f"LiveKit webhook: {event_type} | room={room_name}")
 
-    if event_type == "track_published":
+    if event_type == "room_started":
+        # Clear stale state so a reused room name starts fresh
+        _finished_rooms.discard(room_name)
+        _cleanup_room_state(room_name)
+        logger.info(f"🏠 Room started: {room_name} — stale state cleared")
+    elif event_type == "track_published":
         asyncio.create_task(_on_track_published(room_name, event))
     elif event_type == "participant_joined":
         asyncio.create_task(_on_participant_joined(room_name, event))
