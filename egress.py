@@ -204,13 +204,17 @@ async def start_track_egress(
     session_id: str,
     track_sid: str,
     identity: str,
+    track_kind: str = "audio",   # "audio" → OGG, "video" → WebM
 ) -> dict:
     """
-    Record a single participant's audio track as OGG to S3.
-    Called automatically on track_published (AUDIO) webhook events.
-    S3 path: sessions/{session_id}/audio/{identity}.ogg
+    Record a single participant track to S3.
+      audio → TEMP/sessions/{session_id}/audio/{identity}.ogg
+      video → TEMP/sessions/{session_id}/video/{identity}.webm
     """
-    s3_key = f"TEMP/sessions/{session_id}/audio/{identity}.ogg"
+    if track_kind == "video":
+        s3_key = f"TEMP/sessions/{session_id}/video/{identity}.webm"
+    else:
+        s3_key = f"TEMP/sessions/{session_id}/audio/{identity}.ogg"
     url    = f"{_http_base()}/twirp/livekit.Egress/StartTrackEgress"
     body   = {
         "room_name": room_name,
@@ -229,7 +233,7 @@ async def start_track_egress(
     data = await _post(url, body, _egress_headers(room_name))
     egress_id = data.get("egressId", data.get("egress_id", ""))
     s3_url = f"https://{settings.s3_bucket}.s3.{settings.aws_region}.amazonaws.com/{s3_key}"
-    print(f"  Track egress started : {egress_id} | {identity} → {s3_url}")
+    print(f"  Track egress started : {egress_id} | {identity} [{track_kind}] → {s3_url}")
     data["s3_key"] = s3_key
     data["s3_url"] = s3_url
     return data

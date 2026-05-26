@@ -34,6 +34,7 @@ _track_egress_id_to_room: dict[str, str] = {} # track_egress_id → room_name
 _ended_egress_ids: set[str] = set()           # dedup
 _sse_subscribers: dict[str, list] = {}        # room_name → [Queue]
 _finished_rooms: set[str] = set()             # rooms fully destroyed
+_session_s3_urls: dict[str, dict] = {}        # room_name → {composite, audio:{identity:url}, video:{identity:url}}
 
 # Active (human) participants per room — set is idempotent against duplicate webhooks.
 # LiveKit fires participant_left twice (two edge IPs); a set handles that safely.
@@ -195,16 +196,19 @@ async def _on_track_published(room_name: str, event: dict) -> None:
         )
 
         is_audio = track_type in _AUDIO_TYPES or track_source in _AUDIO_SOURCES
-        if not is_audio:
-            logger.info(f"⊘ Non-audio track skipped: type={track_type} source={track_source}")
+        is_video = track_type == "VIDEO" and track_source == "CAMERA"
+
+        if not is_audio and not is_video:
+            logger.info(f"⊘ Track skipped (not audio/camera): type={track_type} source={track_source}")
             return
 
-        logger.info("✅ Audio track confirmed — proceeding with egress")
+        track_kind = "audio" if is_audio else "video"
+        logger.info(f"✅ {track_kind.upper()} track confirmed — proceeding with egress")
 
-        if room_name not in _active_egress:
+        if is_audio and room_name not in _active_egress:
             await _ensure_composite_egress(room_name)
 
-        await _ensure_track_egress(room_name, track_sid, identity)
+        await _ensure_track_egress(room_name, track_sid, identity, track_kind)
 
     except Exception as e:
         logger.error(f"❌ _on_track_published error: {e}", exc_info=True)
@@ -230,16 +234,18 @@ async def _ensure_composite_egress(room_name: str) -> None:
         )
         egress_id = result.get("egressId") or result.get("egress_id", "")
         _active_egress[room_name] = egress_id
-        logger.info(f"✅ Composite started: {egress_id} | {result.get('s3_url', '')}")
+        s3_url = result.get("s3_url", "")
+        _session_s3_urls.setdefault(room_name, {"audio": {}, "video": {}})["composite"] = s3_url
+        logger.info(f"✅ Composite started: {egress_id} | {s3_url}")
 
     except Exception as e:
         logger.error(f"❌ Composite egress FAILED for {room_name}: {e}", exc_info=True)
 
 
-async def _ensure_track_egress(room_name: str, track_sid: str, identity: str) -> None:
+async def _ensure_track_egress(room_name: str, track_sid: str, identity: str, track_kind: str = "audio") -> None:
     key = (room_name, track_sid)
     if key in _active_track_egress:
-        logger.info(f"⊘ OGG already active for track {track_sid}")
+        logger.info(f"⊘ Track egress already active for {track_sid}")
         return
 
     try:
@@ -248,14 +254,17 @@ async def _ensure_track_egress(room_name: str, track_sid: str, identity: str) ->
             session_id=room_name,
             track_sid=track_sid,
             identity=identity,
+            track_kind=track_kind,
         )
         _active_track_egress.add(key)
         track_egress_id = result.get("egressId") or result.get("egress_id", "")
         if track_egress_id:
             _track_egress_id_to_room[track_egress_id] = room_name
+        s3_url = result.get("s3_url", "")
+        urls = _session_s3_urls.setdefault(room_name, {"audio": {}, "video": {}})
+        urls[track_kind][identity] = s3_url
         logger.info(
-            f"✅ OGG started: {identity} ({track_sid}) → "
-            f"s3://{settings.s3_bucket}/{result.get('s3_key', '')}"
+            f"✅ {track_kind.upper()} track started: {identity} ({track_sid}) → {s3_url}"
         )
     except Exception as e:
         logger.error(f"❌ Track egress FAILED for {identity} ({track_sid}): {e}", exc_info=True)
@@ -360,8 +369,24 @@ async def _on_room_finished(room_name: str) -> None:
             except Exception as e:
                 logger.error(f"❌ Safety-net stop_egress failed: {e}", exc_info=True)
 
+    _log_session_summary(room_name)
     _cleanup_room_state(room_name)
     logger.info(f"🚪 Room finished and cleaned up: {room_name}")
+
+
+def _log_session_summary(room_name: str) -> None:
+    urls = _session_s3_urls.get(room_name, {})
+    if not urls:
+        return
+    lines = [f"📋 Session S3 URLs for {room_name}:"]
+    composite = urls.get("composite", "")
+    if composite:
+        lines.append(f"   🎬 Composite  : {composite}")
+    for identity, url in urls.get("audio", {}).items():
+        lines.append(f"   🎙️  Audio [{identity}]: {url}")
+    for identity, url in urls.get("video", {}).items():
+        lines.append(f"   🎥 Video [{identity}]: {url}")
+    logger.info("\n".join(lines))
 
 
 def _cleanup_room_state(room_name: str) -> None:
@@ -369,6 +394,7 @@ def _cleanup_room_state(room_name: str) -> None:
     _active_egress.pop(room_name, None)
     _composite_ready.discard(room_name)
     _pending_stop.discard(room_name)
+    _session_s3_urls.pop(room_name, None)
     stale_track_keys = {k for k in _active_track_egress if k[0] == room_name}
     _active_track_egress.difference_update(stale_track_keys)
     stale_ids = {eid for eid, rn in _track_egress_id_to_room.items() if rn == room_name}
