@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 
 import jwt as pyjwt
 from fastapi import HTTPException, Request
@@ -31,18 +32,47 @@ _composite_ready: set[str] = set()            # room_names where composite is EG
 _pending_stop: set[str] = set()              # rooms waiting to stop once composite is active
 _active_track_egress: set[tuple] = set()      # (room_name, track_sid)
 _track_egress_id_to_room: dict[str, str] = {} # track_egress_id → room_name
-_ended_egress_ids: set[str] = set()           # dedup
+
+# TTL-bounded sets to prevent unbounded memory growth
+_ended_egress_ids: dict[str, float] = {}      # egress_id → monotonic timestamp (dedup)
+_finished_rooms: dict[str, float] = {}        # room_name → monotonic timestamp
+
 _sse_subscribers: dict[str, list] = {}        # room_name → [Queue]
-_finished_rooms: set[str] = set()             # rooms fully destroyed
 _session_s3_urls: dict[str, dict] = {}        # room_name → {composite, audio:{identity:url}, video:{identity:url}}
 
 # Active (human) participants per room — set is idempotent against duplicate webhooks.
 # LiveKit fires participant_left twice (two edge IPs); a set handles that safely.
 _active_participants: dict[str, set] = {}     # room_name → {identity, ...}
 
-_AUDIO_TYPES = {"AUDIO"}
+_AUDIO_TYPES   = {"AUDIO"}
 _AUDIO_SOURCES = {"MICROPHONE", "SCREEN_SHARE_AUDIO"}
 
+# TTLs for GC
+_FINISHED_ROOM_TTL = 3600    # 1 hour
+_ENDED_EGRESS_TTL  = 86400   # 24 hours
+
+
+# ── Periodic GC ───────────────────────────────────────────────────────────────
+
+async def cleanup_stale_state() -> None:
+    """Remove time-expired entries from TTL-bounded dicts. Run as a background task."""
+    while True:
+        await asyncio.sleep(300)  # every 5 minutes
+        now = time.monotonic()
+
+        stale_rooms = [k for k, t in _finished_rooms.items() if now - t > _FINISHED_ROOM_TTL]
+        for k in stale_rooms:
+            _finished_rooms.pop(k, None)
+
+        stale_egress = [k for k, t in _ended_egress_ids.items() if now - t > _ENDED_EGRESS_TTL]
+        for k in stale_egress:
+            _ended_egress_ids.pop(k, None)
+
+        if stale_rooms or stale_egress:
+            logger.debug(f"GC: evicted {len(stale_rooms)} rooms, {len(stale_egress)} egress IDs")
+
+
+# ── Webhook handler ───────────────────────────────────────────────────────────
 
 def verify_livekit_signature(body: bytes, auth_header: str) -> bool:
     try:
@@ -50,7 +80,7 @@ def verify_livekit_signature(body: bytes, auth_header: str) -> bool:
             auth_header.strip(),
             settings.livekit_api_secret,
             algorithms=["HS256"],
-            leeway=30,
+            leeway=5,  # 5s is sufficient; 30s was unnecessarily wide
         )
         body_hash = base64.b64encode(hashlib.sha256(body).digest()).decode()
         return hmac.compare_digest(claims.get("sha256", ""), body_hash)
@@ -85,7 +115,7 @@ async def handle_livekit_webhook(request: Request) -> dict:
 
     if event_type == "room_started":
         # Clear stale state so a reused room name starts fresh
-        _finished_rooms.discard(room_name)
+        _finished_rooms.pop(room_name, None)
         _cleanup_room_state(room_name)
         logger.info(f"🏠 Room started: {room_name} — stale state cleared")
     elif event_type == "track_published":
@@ -298,7 +328,7 @@ async def _on_egress_ended(room_name: str, event: dict) -> None:
     if egress_id in _ended_egress_ids:
         logger.info(f"⊘ Duplicate egress_ended ignored: {egress_id}")
         return
-    _ended_egress_ids.add(egress_id)
+    _ended_egress_ids[egress_id] = time.monotonic()
 
     is_composite = (_active_egress.get(room_name) == egress_id)
     is_track = (egress_id in _track_egress_id_to_room)
@@ -323,10 +353,10 @@ async def _on_egress_ended(room_name: str, event: dict) -> None:
 
         for queue in _sse_subscribers.get(room_name, []):
             await queue.put({
-                "event": "egress_ended",
+                "event":      "egress_ended",
                 "session_id": room_name,
-                "status": status,
-                "success": status == "EGRESS_COMPLETE",
+                "status":     status,
+                "success":    status == "EGRESS_COMPLETE",
             })
 
     if is_track:
@@ -346,7 +376,7 @@ async def _on_room_finished(room_name: str) -> None:
     (we called stop_egress on participant_left when count hit 0).
     Just clean up state.
     """
-    _finished_rooms.add(room_name)
+    _finished_rooms[room_name] = time.monotonic()
 
     egress_id = _active_egress.get(room_name)
     if egress_id:
@@ -412,11 +442,16 @@ def subscribe_sse(room_name: str) -> asyncio.Queue:
 
 def unsubscribe_sse(room_name: str, queue: asyncio.Queue) -> None:
     subs = _sse_subscribers.get(room_name, [])
-    if queue in subs:
+    try:
         subs.remove(queue)
+    except ValueError:
+        pass
+    # Remove the room key entirely when the last subscriber leaves
+    if not subs:
+        _sse_subscribers.pop(room_name, None)
 
 
 def clear_active_egress(room_name: str) -> None:
     """Manual stop from /egress/stop endpoint."""
     _cleanup_room_state(room_name)
-    _finished_rooms.discard(room_name)
+    _finished_rooms.pop(room_name, None)

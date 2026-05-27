@@ -1,19 +1,75 @@
 """
 egress.py — LiveKit room + egress operations via Twirp HTTP API.
 
-All functions are async and use httpx.
-Errors print the raw LiveKit response before raising so debugging is easy.
+All functions are async and use a shared httpx.AsyncClient (initialized via
+init_http_client() in the app lifespan). Tokens are cached for 9 minutes to
+avoid HMAC-SHA256 signing on every request. boto3 S3 calls run in a thread
+pool via asyncio.to_thread() so they never block the event loop.
 """
 
 import asyncio
-import httpx
+import time
+
 import boto3
+import httpx
 from botocore.exceptions import ClientError
+
 from config import settings
 from tokens import generate_admin_token, generate_egress_token, generate_room_admin_token
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── HTTP client (persistent connection pool) ──────────────────────────────────
+
+_http_client: httpx.AsyncClient | None = None
+
+
+async def init_http_client() -> None:
+    global _http_client
+    _http_client = httpx.AsyncClient(timeout=15)
+
+
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    if _http_client is None or _http_client.is_closed:
+        raise RuntimeError("HTTP client not initialized — call init_http_client() in lifespan")
+    return _http_client
+
+
+# ── S3 client singleton (thread-safe, reuses connection pool) ─────────────────
+
+s3_client = boto3.client(
+    "s3",
+    region_name=settings.aws_region,
+    aws_access_key_id=settings.aws_access_key,
+    aws_secret_access_key=settings.aws_secret_key,
+)
+
+
+# ── JWT token cache (9-min TTL, tokens expire in 10 min) ─────────────────────
+
+_token_cache: dict[str, tuple[str, float]] = {}
+
+
+def _cached_token(cache_key: str, generator) -> str:
+    """Return a cached JWT or generate + cache a fresh one."""
+    now = time.monotonic()
+    entry = _token_cache.get(cache_key)
+    if entry:
+        token, exp = entry
+        if now < exp:
+            return token
+    token = generator()
+    _token_cache[cache_key] = (token, now + 540)  # cache for 9 min (token TTL = 10 min)
+    return token
+
+
+# ── Header builders (use cached tokens) ──────────────────────────────────────
 
 def _http_base() -> str:
     """Convert wss:// or ws:// LiveKit URL to https:// for REST calls."""
@@ -26,30 +82,40 @@ def _http_base() -> str:
 
 
 def _admin_headers() -> dict:
-    token = generate_admin_token(settings.livekit_api_key, settings.livekit_api_secret)
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type":  "application/json",
-    }
+    token = _cached_token(
+        "admin",
+        lambda: generate_admin_token(settings.livekit_api_key, settings.livekit_api_secret),
+    )
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
 def _egress_headers(room_name: str) -> dict:
-    token = generate_egress_token(room_name, settings.livekit_api_key, settings.livekit_api_secret)
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type":  "application/json",
-    }
+    token = _cached_token(
+        f"egress:{room_name}",
+        lambda: generate_egress_token(room_name, settings.livekit_api_key, settings.livekit_api_secret),
+    )
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
+
+def _room_admin_headers(room_name: str) -> dict:
+    token = _cached_token(
+        f"room_admin:{room_name}",
+        lambda: generate_room_admin_token(room_name, settings.livekit_api_key, settings.livekit_api_secret),
+    )
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+# ── HTTP helper ───────────────────────────────────────────────────────────────
 
 async def _post(url: str, body: dict, headers: dict) -> dict:
-    """POST helper with error logging."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json=body, headers=headers)
-        if resp.status_code not in (200, 201):
-            print(f"  LiveKit error {resp.status_code} → {url}")
-            print(f"  Response: {resp.text}")
-        resp.raise_for_status()
-        return resp.json()
+    """POST to LiveKit Twirp API using the shared persistent client."""
+    client = _get_client()
+    resp = await client.post(url, json=body, headers=headers)
+    if resp.status_code not in (200, 201):
+        print(f"  LiveKit error {resp.status_code} → {url}")
+        print(f"  Response: {resp.text}")
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ── Room ──────────────────────────────────────────────────────────────────────
@@ -79,25 +145,21 @@ async def get_room_participants(room_name: str) -> list:
 
     # ListParticipants requires a room-scoped token on LiveKit Cloud;
     # a global admin token (no 'room' field) returns 401.
-    room_headers = {
-        "Authorization": f"Bearer {generate_room_admin_token(room_name, settings.livekit_api_key, settings.livekit_api_secret)}",
-        "Content-Type":  "application/json",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json=body, headers=room_headers)
-        if resp.status_code not in (200, 201):
-            print(f"  ListParticipants error {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
-        data = resp.json()
+    client = _get_client()
+    resp = await client.post(url, json=body, headers=_room_admin_headers(room_name))
+    if resp.status_code not in (200, 201):
+        print(f"  ListParticipants error {resp.status_code}: {resp.text}")
+    resp.raise_for_status()
+    data = resp.json()
 
     participants = data.get("participants", [])
     return [
         {
-            "identity": p.get("identity", ""),
-            "name":     p.get("name", ""),
-            "state":    p.get("state", ""),
+            "identity":  p.get("identity", ""),
+            "name":      p.get("name", ""),
+            "state":     p.get("state", ""),
             "joined_at": p.get("joined_at", ""),
-            "tracks":   len(p.get("tracks", [])),
+            "tracks":    len(p.get("tracks", [])),
         }
         for p in participants
     ]
@@ -111,33 +173,23 @@ async def start_composite_egress(
     audio_only: bool = False,
 ) -> dict:
     """
-    Start a RoomCompositeEgress that records the full room.
-
-    Layout:
-      - Uses custom HTML template (static/layout.html) when PUBLIC_URL is set.
-        Each tile shows a large role label (DOCTOR / INTERPRETER) from the JWT 'name' field.
-      - Falls back to built-in 'grid-dark' if PUBLIC_URL is not configured.
-      - Renders as MP4 (video+audio) or OGG (audio-only)
+    Start a RoomCompositeEgress that records the full room using the built-in grid-dark layout.
+    Renders as MP4 (video+audio) or OGG (audio-only).
 
     Important: call this AFTER participants have joined and published tracks.
     LiveKit will abort the egress if no tracks are active when it starts.
-
-    Returns dict with egress_id and s3_key.
     """
     file_type = "OGG" if audio_only else "MP4"
     extension = "ogg" if audio_only else "mp4"
     s3_key    = f"TEMP/sessions/{session_id}/composite_recording.{extension}"
 
-    url  = f"{_http_base()}/twirp/livekit.Egress/StartRoomCompositeEgress"
+    url = f"{_http_base()}/twirp/livekit.Egress/StartRoomCompositeEgress"
 
-    # Use custom layout if PUBLIC_URL is set, otherwise fall back to built-in grid-dark.
-    # Custom layout renders each participant tile with a large role label (DOCTOR / INTERPRETER).
-    custom_url = settings.public_url.rstrip("/") if settings.public_url else ""
     body: dict = {
         "room_name":  room_name,
         "audio_only": audio_only,
+        "layout":     "grid-dark",
     }
-    body["layout"] = "grid-dark"
 
     body["file_outputs"] = [{
         "file_type": file_type,
@@ -172,31 +224,29 @@ async def stop_egress(egress_id: str, room_name: str) -> dict:
     url  = f"{_http_base()}/twirp/livekit.Egress/StopEgress"
     body = {"egress_id": egress_id}
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json=body, headers=_egress_headers(room_name))
+    client = _get_client()
+    resp = await client.post(url, json=body, headers=_egress_headers(room_name))
 
-        # 412 = already ended/aborted — not an error
-        if resp.status_code == 412:
-            print(f"  Egress {egress_id} already stopped (aborted/ended) — OK.")
-            return {"egress_id": egress_id, "status": "ENDED"}
+    # 412 = already ended/aborted — not an error
+    if resp.status_code == 412:
+        print(f"  Egress {egress_id} already stopped (aborted/ended) — OK.")
+        return {"egress_id": egress_id, "status": "ENDED"}
 
-        if resp.status_code not in (200, 201):
-            print(f"  StopEgress error {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
-        data = resp.json()
+    if resp.status_code not in (200, 201):
+        print(f"  StopEgress error {resp.status_code}: {resp.text}")
+    resp.raise_for_status()
+    data = resp.json()
 
-        # Print the S3 destination from the egress response if available
-        for output in data.get("file_results", []):
-            location = output.get("location", "")
-            if location:
-                print(f"  Recording saved : {location}")
-            else:
-                # Fallback: reconstruct from filename if location absent
-                fname = output.get("filename", "")
-                if fname:
-                    print(f"  Recording file  : s3://{settings.s3_bucket}/{fname}")
+    for output in data.get("file_results", []):
+        location = output.get("location", "")
+        if location:
+            print(f"  Recording saved : {location}")
+        else:
+            fname = output.get("filename", "")
+            if fname:
+                print(f"  Recording file  : s3://{settings.s3_bucket}/{fname}")
 
-        return data
+    return data
 
 
 async def start_track_egress(
@@ -241,20 +291,12 @@ async def start_track_egress(
 
 async def get_recording_presigned_url(session_id: str, expires_in: int = 3600) -> dict:
     """
-    Generate a presigned URL for the session's composite recording asynchronously.
-    Raises FileNotFoundError if the file hasn't been uploaded to S3 yet
-    (egress still running or upload in progress).
+    Generate a presigned URL for the session's composite recording.
+    Runs the boto3 calls in a thread pool to avoid blocking the event loop.
+    Raises FileNotFoundError if the file hasn't landed in S3 yet.
     """
-    def _blocking_get_url():
+    def _blocking():
         s3_key = f"TEMP/sessions/{session_id}/composite_recording.mp4"
-        s3_client = boto3.client(
-            "s3",
-            region_name=settings.aws_region,
-            aws_access_key_id=settings.aws_access_key,
-            aws_secret_access_key=settings.aws_secret_key,
-        )
-
-        # Verify the file exists before handing out a URL that will 404.
         try:
             s3_client.head_object(Bucket=settings.s3_bucket, Key=s3_key)
         except ClientError as e:
@@ -275,8 +317,7 @@ async def get_recording_presigned_url(session_id: str, expires_in: int = 3600) -
         print(f"  Presigned URL ({expires_in}s): {url}")
         return {"s3_key": s3_key, "url": url, "expires_in": expires_in}
 
-    # Run boto3 S3 calls in thread pool to avoid blocking event loop
-    return await asyncio.to_thread(_blocking_get_url)
+    return await asyncio.to_thread(_blocking)
 
 
 async def list_egress(room_name: str) -> dict:
@@ -287,9 +328,9 @@ async def list_egress(room_name: str) -> dict:
     url  = f"{_http_base()}/twirp/livekit.Egress/ListEgress"
     body = {"room_name": room_name}
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json=body, headers=_egress_headers(room_name))
-        if resp.status_code not in (200, 201):
-            print(f"  ListEgress error {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
-        return resp.json()
+    client = _get_client()
+    resp = await client.post(url, json=body, headers=_egress_headers(room_name))
+    if resp.status_code not in (200, 201):
+        print(f"  ListEgress error {resp.status_code}: {resp.text}")
+    resp.raise_for_status()
+    return resp.json()

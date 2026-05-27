@@ -3,21 +3,29 @@ interpreter-backend — main.py
 FastAPI entry point: token minting, room management, health check.
 """
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
-from contextlib import asynccontextmanager
 import asyncio
 import json
 import logging
 import uvicorn
 
+from contextlib import asynccontextmanager
+from botocore.exceptions import ClientError as BotoClientError
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import StreamingResponse
+
 logging.basicConfig(level=logging.INFO)
 
 from config import settings
-from tokens import generate_participant_token, generate_admin_token
-from webhook import handle_livekit_webhook, clear_active_egress, subscribe_sse, unsubscribe_sse
+from tokens import generate_participant_token
+from webhook import (
+    handle_livekit_webhook,
+    clear_active_egress,
+    subscribe_sse,
+    unsubscribe_sse,
+    cleanup_stale_state,
+)
 from egress import (
     create_room,
     start_composite_egress,
@@ -25,6 +33,9 @@ from egress import (
     list_egress,
     get_room_participants,
     get_recording_presigned_url,
+    init_http_client,
+    close_http_client,
+    s3_client,
 )
 from models import (
     CreateRoomRequest,
@@ -45,10 +56,21 @@ from models import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await init_http_client()
+    gc_task = asyncio.create_task(cleanup_stale_state())
+
     print(f"✅ Interpreter Backend starting")
     print(f"   LiveKit : {settings.livekit_url}")
     print(f"   S3      : s3://{settings.s3_bucket} ({settings.aws_region})")
+
     yield
+
+    gc_task.cancel()
+    try:
+        await gc_task
+    except asyncio.CancelledError:
+        pass
+    await close_http_client()
     print("Interpreter Backend shutting down.")
 
 
@@ -58,15 +80,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
 
 # ── SSE ───────────────────────────────────────────────────────────────────────
 
@@ -131,9 +151,9 @@ async def room_create(body: CreateRoomRequest):
 
 @app.get("/token", response_model=TokenResponse, tags=["token"])
 async def get_token(
-    room: str  = Query(..., description="LiveKit room / session_id"),
+    room: str     = Query(..., description="LiveKit room / session_id"),
     identity: str = Query(..., description="Unique participant identity string"),
-    role: str  = Query(..., description="patient | doctor | interpreter"),
+    role: str     = Query(..., description="patient | doctor | interpreter"),
 ):
     """
     Mint a participant JWT for the LiveKit frontend SDK.
@@ -143,7 +163,7 @@ async def get_token(
     if role not in VALID_ROLES:
         raise HTTPException(status_code=400, detail=f"role must be one of {VALID_ROLES}")
 
-    display_name = role.upper()  # short role label renders clearly on video tile
+    display_name = role.upper()
     token = generate_participant_token(
         room_name=room,
         identity=identity,
@@ -221,17 +241,14 @@ async def egress_status(session_id: str = Query(...)):
     Returns both LiveKit egress state AND S3 file availability.
     Use this to know when recording is ready — poll until status == 'ready'.
     """
-    import boto3
-    from botocore.exceptions import ClientError as BotoClientError
-
-    # ── 1. Check LiveKit egress state ─────────────────────────────────────────
+    # 1. LiveKit egress state (async — non-blocking)
     livekit_status = "unknown"
     egress_id      = None
     try:
-        data    = await list_egress(room_name=session_id)
-        items   = data.get("items", [])
+        data  = await list_egress(room_name=session_id)
+        items = data.get("items", [])
         if items:
-            latest       = items[-1]
+            latest         = items[-1]
             livekit_status = latest.get("status", "unknown")
             egress_id      = latest.get("egressId") or latest.get("egress_id")
         else:
@@ -239,27 +256,24 @@ async def egress_status(session_id: str = Query(...)):
     except Exception as e:
         livekit_status = f"error: {e}"
 
-    # ── 2. Check S3 file ──────────────────────────────────────────────────────
-    s3_key  = f"TEMP/sessions/{session_id}/composite_recording.mp4"
-    s3      = boto3.client(
-        "s3",
-        region_name=settings.aws_region,
-        aws_access_key_id=settings.aws_access_key,
-        aws_secret_access_key=settings.aws_secret_key,
-    )
-    s3_ready = False
-    size_mb  = None
-    try:
-        head    = s3.head_object(Bucket=settings.s3_bucket, Key=s3_key)
-        size_mb = round(head["ContentLength"] / (1024 * 1024), 2)
-        s3_ready = True
-    except BotoClientError:
-        pass
+    # 2. S3 file check — offload blocking boto3 I/O to thread pool
+    s3_key = f"TEMP/sessions/{session_id}/composite_recording.mp4"
 
-    status = "ready" if s3_ready else (
-        "egress_active" if livekit_status in ("EGRESS_STARTING", "EGRESS_ACTIVE") else
-        "uploading"     if livekit_status in ("EGRESS_ENDING", "EGRESS_COMPLETE") else
-        "failed"        if livekit_status in ("EGRESS_FAILED", "no_egress_found") else
+    def _check_s3():
+        try:
+            head = s3_client.head_object(Bucket=settings.s3_bucket, Key=s3_key)
+            return head["ContentLength"]
+        except BotoClientError:
+            return None
+
+    content_length = await asyncio.to_thread(_check_s3)
+    s3_ready = content_length is not None
+    size_mb  = round(content_length / (1024 * 1024), 2) if content_length else None
+
+    status = "ready"          if s3_ready else (
+        "egress_active"       if livekit_status in ("EGRESS_STARTING", "EGRESS_ACTIVE") else
+        "uploading"           if livekit_status in ("EGRESS_ENDING", "EGRESS_COMPLETE") else
+        "failed"              if livekit_status in ("EGRESS_FAILED", "no_egress_found") else
         "processing"
     )
 
@@ -309,59 +323,54 @@ async def session_recordings(
     Call this after egress has ended. Any missing file type is simply omitted rather
     than returning a 404 — check the composite / audio / video fields individually.
     """
-    import boto3
-    from botocore.exceptions import ClientError as BotoClientError
-
-    s3 = boto3.client(
-        "s3",
-        region_name=settings.aws_region,
-        aws_access_key_id=settings.aws_access_key,
-        aws_secret_access_key=settings.aws_secret_key,
-    )
-
-    def presign(key: str) -> str:
-        return s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": settings.s3_bucket, "Key": key},
-            ExpiresIn=expires_in,
-        )
-
-    # List everything under TEMP/sessions/{session_id}/
     prefix = f"TEMP/sessions/{session_id}/"
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        keys: list[str] = []
+
+    def _list_and_presign():
+        paginator = s3_client.get_paginator("list_objects_v2")
+        keys = []
         for page in paginator.paginate(Bucket=settings.s3_bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 keys.append(obj["Key"])
+
+        results: dict = {"composite": None, "audio": [], "video": []}
+        for key in keys:
+            tail = key[len(prefix):]
+            try:
+                url = s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": settings.s3_bucket, "Key": key},
+                    ExpiresIn=expires_in,
+                )
+            except BotoClientError:
+                continue
+
+            if tail == "composite_recording.mp4":
+                results["composite"] = {"key": key, "url": url}
+            elif tail.startswith("audio/") and tail.endswith(".ogg"):
+                results["audio"].append({"key": key, "url": url, "identity": tail[len("audio/"):-len(".ogg")]})
+            elif tail.startswith("video/") and tail.endswith(".webm"):
+                results["video"].append({"key": key, "url": url, "identity": tail[len("video/"):-len(".webm")]})
+
+        return results
+
+    try:
+        data = await asyncio.to_thread(_list_and_presign)
     except BotoClientError as e:
         raise HTTPException(status_code=500, detail=f"S3 list error: {e}")
 
-    composite_rec: SessionRecording | None = None
-    audio_recs:    list[SessionRecording] = []
-    video_recs:    list[SessionRecording] = []
-
-    for key in keys:
-        tail = key[len(prefix):]  # e.g. "composite_recording.mp4" or "audio/doctor_1.ogg"
-        try:
-            url = presign(key)
-        except BotoClientError:
-            continue
-
-        if tail == "composite_recording.mp4":
-            composite_rec = SessionRecording(
-                kind="composite", identity="", s3_key=key, url=url, expires_in=expires_in
-            )
-        elif tail.startswith("audio/") and tail.endswith(".ogg"):
-            identity = tail[len("audio/"):-len(".ogg")]
-            audio_recs.append(SessionRecording(
-                kind="audio", identity=identity, s3_key=key, url=url, expires_in=expires_in
-            ))
-        elif tail.startswith("video/") and tail.endswith(".webm"):
-            identity = tail[len("video/"):-len(".webm")]
-            video_recs.append(SessionRecording(
-                kind="video", identity=identity, s3_key=key, url=url, expires_in=expires_in
-            ))
+    c = data["composite"]
+    composite_rec = (
+        SessionRecording(kind="composite", identity="", s3_key=c["key"], url=c["url"], expires_in=expires_in)
+        if c else None
+    )
+    audio_recs = [
+        SessionRecording(kind="audio", identity=a["identity"], s3_key=a["key"], url=a["url"], expires_in=expires_in)
+        for a in data["audio"]
+    ]
+    video_recs = [
+        SessionRecording(kind="video", identity=v["identity"], s3_key=v["key"], url=v["url"], expires_in=expires_in)
+        for v in data["video"]
+    ]
 
     return SessionRecordingsResponse(
         session_id=session_id,
@@ -381,108 +390,77 @@ async def participant_recordings(
     Get presigned URLs for all per-participant OGG recordings.
 
     Each participant's audio is recorded separately with their identity in the filename.
-    This endpoint returns all of them with their role (parsed from participant name).
-
-    Frontend can display these side-by-side with role labels to show who's speaking when.
-
     Returns 404 if no recordings exist yet (egress still running or no audio tracks published).
     """
-    try:
-        import boto3
-        from botocore.exceptions import ClientError
-        from models import ParticipantRecording, ParticipantRecordingsResponse
+    from models import ParticipantRecording, ParticipantRecordingsResponse
 
-        # List S3 objects matching TEMP/sessions/{session_id}/audio/*.ogg
-        s3_client = boto3.client(
-            "s3",
-            region_name=settings.aws_region,
-            aws_access_key_id=settings.aws_access_key,
-            aws_secret_access_key=settings.aws_secret_key,
-        )
+    prefix = f"TEMP/sessions/{session_id}/audio/"
 
-        prefix = f"TEMP/sessions/{session_id}/audio/"
+    def _list_ogg_files():
         try:
             resp = s3_client.list_objects_v2(Bucket=settings.s3_bucket, Prefix=prefix)
-        except ClientError as e:
+        except BotoClientError as e:
             raise HTTPException(status_code=500, detail=f"S3 error: {e}")
-        
-        if "Contents" not in resp:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No per-participant recordings found for session {session_id}. Egress may still be running or no audio tracks detected."
-            )
-        
-        # Filter for .ogg files (per-participant recordings)
-        ogg_files = [
-            obj for obj in resp.get("Contents", [])
-            if obj["Key"].endswith(".ogg")
-        ]
-        
-        if not ogg_files:
-            raise HTTPException(
-                status_code=404,
-                detail="No per-participant audio recordings found yet. Waiting for audio tracks to be published..."
-            )
-        
-        # Get room participants to map identity → role (from participant.name)
-        try:
-            participants_data = await get_room_participants(session_id)
-            # Build identity → name mapping
-            identity_to_role = {
-                p["identity"]: p.get("name", p["identity"])
-                for p in participants_data.get("participants", [])
-            }
-        except HTTPException:
-            # Room doesn't exist anymore (session ended) - can't get participants
-            # But we can still return the OGG files with identity as role
-            identity_to_role = {}
-        except Exception as e:
-            # Other errors - use identity as role
-            identity_to_role = {}
-        
-        # Build recording list
-        recordings = []
+
+        contents = resp.get("Contents", [])
+        ogg_files = [obj for obj in contents if obj["Key"].endswith(".ogg")]
+
+        results = []
         for obj in ogg_files:
             s3_key = obj["Key"]
-            # Extract identity from filename: sessions/{session_id}/audio/{identity}.ogg
-            filename = s3_key.split("/")[-1]  # e.g., "doctor_1234567.ogg"
-            identity = filename.replace(".ogg", "")
-            
-            # Get role for this identity from participant list
-            role = identity_to_role.get(identity, identity)
-            
-            # Generate presigned URL
+            identity = s3_key.split("/")[-1].removesuffix(".ogg")
             try:
                 url = s3_client.generate_presigned_url(
                     "get_object",
                     Params={"Bucket": settings.s3_bucket, "Key": s3_key},
                     ExpiresIn=expires_in,
                 )
-                recordings.append(
-                    ParticipantRecording(
-                        identity=identity,
-                        role=role,
-                        s3_key=s3_key,
-                        url=url,
-                        expires_in=expires_in,
-                    )
-                )
-            except ClientError:
-                continue  # Skip files we can't generate URLs for
-        
-        return ParticipantRecordingsResponse(
-            session_id=session_id,
-            recordings=recordings,
-            expires_in=expires_in,
-        )
-        
+                results.append({"identity": identity, "s3_key": s3_key, "url": url})
+            except BotoClientError:
+                continue
+        return results
+
+    try:
+        file_list = await asyncio.to_thread(_list_ogg_files)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing recordings: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error listing recordings: {e}")
+
+    if not file_list:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No per-participant recordings found for session {session_id}. "
+                   "Egress may still be running or no audio tracks detected.",
+        )
+
+    # Map identity → display name from live room participants (best-effort; room may be gone)
+    identity_to_role: dict[str, str] = {}
+    try:
+        participants = await get_room_participants(session_id)
+        identity_to_role = {p["identity"]: p.get("name", p["identity"]) for p in participants}
+    except Exception:
+        pass
+
+    recordings = [
+        ParticipantRecording(
+            identity=f["identity"],
+            role=identity_to_role.get(f["identity"], f["identity"]),
+            s3_key=f["s3_key"],
+            url=f["url"],
+            expires_in=expires_in,
+        )
+        for f in file_list
+    ]
+
+    return ParticipantRecordingsResponse(
+        session_id=session_id,
+        recordings=recordings,
+        expires_in=expires_in,
+    )
 
 
-
+@app.get("/egress/list", tags=["egress"])
 async def egress_list(session_id: str = Query(...)):
     """List all egress jobs for a session (active + historical)."""
     try:
