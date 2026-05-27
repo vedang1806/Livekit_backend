@@ -1,6 +1,12 @@
-FROM python:3.13-slim
+FROM python:3.13
 
 WORKDIR /service
+
+# Add build tools needed for pydantic-core Rust compilation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies first (layer cached unless requirements.txt changes)
 COPY requirements.txt .
