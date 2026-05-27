@@ -1,9 +1,9 @@
 """
-models.py — Pydantic request and response models for all endpoints.
+app/models.py — Pydantic request and response models for all endpoints.
 """
 
-from pydantic import BaseModel
 from typing import List, Optional
+from pydantic import BaseModel
 
 
 # ── Room ──────────────────────────────────────────────────────────────────────
@@ -31,7 +31,7 @@ class TokenResponse(BaseModel):
 
 class StartEgressRequest(BaseModel):
     session_id: str
-    audio_only: bool = False    # False = MP4 video+audio, True = OGG audio only
+    audio_only: bool = False    # False = MP4 video+audio, True = OGG audio-only
 
 class StartEgressResponse(BaseModel):
     egress_id:  str
@@ -63,43 +63,39 @@ class ParticipantsResponse(BaseModel):
     participants: List[ParticipantInfo]
 
 
-# ── Recording URL ─────────────────────────────────────────────────────────────
+# ── Recording URLs ────────────────────────────────────────────────────────────
 
 class RecordingUrlResponse(BaseModel):
-    session_id:  str
-    s3_key:      str
-    url:         str
-    expires_in:  int             # seconds until the presigned URL expires
-
-
-# ── Per-Participant Recordings ────────────────────────────────────────────────
+    session_id: str
+    s3_key:     str
+    url:        str
+    expires_in: int
 
 class ParticipantRecording(BaseModel):
-    identity:    str             # participant identity (e.g., "doctor_123")
-    role:        str             # role from participant name (DOCTOR, PATIENT, INTERPRETER)
-    s3_key:      str             # S3 path to the OGG file
-    url:         str             # presigned URL to download
-    expires_in:  int             # seconds until URL expires
+    identity:   str
+    role:       str
+    s3_key:     str
+    url:        str
+    expires_in: int
 
 class ParticipantRecordingsResponse(BaseModel):
-    session_id:  str
-    recordings:  List[ParticipantRecording]  # one per participant
-    expires_in:  int
+    session_id: str
+    recordings: List[ParticipantRecording]
+    expires_in: int
 
 class SessionRecording(BaseModel):
     kind:       str   # "composite" | "audio" | "video"
-    identity:   str   # participant identity, empty string for composite
+    identity:   str   # empty string for composite
     s3_key:     str
     url:        str
     expires_in: int
 
 class SessionRecordingsResponse(BaseModel):
-    session_id:  str
-    composite:   Optional[SessionRecording]
-    audio:       List[SessionRecording]
-    video:       List[SessionRecording]
-    expires_in:  int
-
+    session_id: str
+    composite:  Optional[SessionRecording]
+    audio:      List[SessionRecording]
+    video:      List[SessionRecording]
+    expires_in: int
 
 class HealthResponse(BaseModel):
     status:      str

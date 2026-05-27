@@ -1,10 +1,10 @@
 """
-config.py — loads all settings from .env via pydantic-settings.
+app/config.py — loads all settings from .env via pydantic-settings.
 Never hardcode credentials here — use the .env file.
 """
 
-from pydantic_settings import BaseSettings
 from typing import List
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
