@@ -68,3 +68,15 @@ class SessionRepository:
             participant.left_at = datetime.now(timezone.utc)
             await self._db.flush()
         return participant
+
+    async def set_composite_s3_url(self, room_name: str, s3_url: str) -> None:
+        session = await self.get_active(room_name)
+        if session:
+            session.composite_s3_url = s3_url
+            await self._db.flush()
+
+    async def set_participant_track_s3_url(self, session_id: int, identity: str, s3_url: str) -> None:
+        participant = await self.get_active_participant(session_id, identity)
+        if participant:
+            participant.track_s3_url = s3_url
+            await self._db.flush()

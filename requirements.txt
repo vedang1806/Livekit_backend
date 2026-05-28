@@ -14,3 +14,14 @@ alembic==1.14.0
 asyncpg==0.30.0
 psycopg2-binary==2.9.10
 
+# Admin panel
+sqladmin==0.20.1
+itsdangerous==2.2.0
+
+# Background worker
+celery==5.4.0
+redis==5.2.0
+
+# Video frame extraction (ffmpeg must be installed in the OS/Docker image)
+ffmpeg-python==0.2.0
+
