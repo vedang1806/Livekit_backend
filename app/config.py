@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: List[str] = ["http://localhost:3000"]
 
+    # Database — async URL used by the app, sync URL used by alembic
+    database_url: str = "postgresql+asyncpg://livekit:livekit@postgres:5432/livekit_db"
+
+    @property
+    def database_url_sync(self) -> str:
+        """psycopg2 URL for alembic migrations (sync driver)."""
+        return self.database_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
